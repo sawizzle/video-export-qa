@@ -1,0 +1,13 @@
+{
+  "video": {
+    "codec": "gif",
+    "width": 480,
+    "height": 270
+  },
+  "gif": {
+    "fps": 15,
+    "expect_duration_s": 3.0,
+    "expect_frames": 45,
+    "tol_s": 0.02
+  }
+}

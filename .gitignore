@@ -1,0 +1,4 @@
+# test artefacts and caches (the tests regenerate their media)
+_work/
+__pycache__/
+*.pyc
