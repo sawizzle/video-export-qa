@@ -20,7 +20,8 @@ sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "packages" / "video-export-qa" / "scripts"
-WORK = ROOT / "_work" / "video-export-qa" / "integrator" / "tests-provenance"
+from ffmpeg_fixtures import private_work_folder  # noqa: E402
+WORK = Path(private_work_folder(ROOT, "integrator", "tests-provenance"))
 sys.path.insert(0, str(SCRIPTS))
 
 import common  # noqa: E402

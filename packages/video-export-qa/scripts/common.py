@@ -23,7 +23,7 @@ import subprocess
 import sys
 from fractions import Fraction
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 
@@ -83,6 +83,23 @@ def find_on_path(name):
     return None
 
 
+def skipped_current_folder_copy(name):
+    """The path of `name` when the only copy sits in the current folder AND that folder is listed on PATH
+    (it looks installed, but the current folder is never searched), else None. Used only for the error message."""
+    try:
+        here = os.getcwd()
+    except OSError:
+        return None
+    names = [name + ".exe"] if os.name == "nt" else [name]
+    for entry in os.get_exec_path():
+        if entry and os.path.isabs(entry) and is_current_folder(entry, here):
+            for candidate_name in names:
+                candidate = os.path.join(entry, candidate_name)
+                if os.path.isfile(candidate):
+                    return os.path.abspath(candidate)
+    return None
+
+
 def find_tool(name, override=None):
     """Return the absolute path of ffmpeg/ffprobe: explicit path first, else the program search path
     (never the current folder)."""
@@ -92,9 +109,17 @@ def find_tool(name, override=None):
         raise ToolMissing("%s not found at the path given: %s" % (name, override))
     found = find_on_path(name)
     if not found:
+        in_here = skipped_current_folder_copy(name)
+        if in_here:
+            raise ToolMissing(
+                "%s was found only in the current folder (%s), which is listed on PATH, but the current folder is "
+                "never searched (a folder holding an export must not be able to replace the real tool). Run the "
+                "command from the folder that holds the export, not from FFmpeg's own folder, or pass --%s PATH."
+                % (name, in_here, name)
+            )
         raise ToolMissing(
-            "%s was not found on PATH (the current folder is never searched). Install FFmpeg, "
-            "or pass --%s PATH." % (name, name)
+            "%s was not found on PATH (the current folder is never searched). Install FFmpeg and put its "
+            "folder on PATH, or pass --%s PATH." % (name, name)
         )
     return found
 
@@ -120,8 +145,32 @@ def sha256_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+UTF32_BOMS = (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")
+
+
+def decode_spec_text(raw, path):
+    """The text of a spec file. UTF-8 (with or without a byte order mark) and UTF-16 with a byte order mark
+    (what Windows PowerShell writes with > or Out-File) are read; anything else is a clear error."""
+    if raw.startswith(UTF32_BOMS):
+        raise UsageError("spec file %s is saved as UTF-32, which is not read; save it as UTF-8 (a BOM is accepted)" % path)
+    if raw.startswith(UTF16_BOMS):
+        try:
+            return raw.decode("utf-16")  # this codec reads the byte order mark and drops it
+        except UnicodeDecodeError:
+            raise UsageError("spec file %s starts like UTF-16 text but cannot be read as UTF-16; save it as UTF-8" % path)
+    if b"\x00" in raw[:4]:
+        raise UsageError("spec file %s looks like UTF-16 or UTF-32 text without a byte order mark; save it as UTF-8 "
+                         "(or as UTF-16 with a byte order mark)" % path)
+    try:
+        return raw.decode("utf-8-sig")  # drops a UTF-8 byte order mark when there is one
+    except UnicodeDecodeError as exc:
+        raise UsageError("spec file %s is not UTF-8 text (an unreadable byte at position %d); save it as UTF-8"
+                         % (path, exc.start))
+
+
 def load_spec(path):
-    """Read a JSON spec file. Returns (dict, sha256 of the file bytes)."""
+    """Read a JSON spec file. Returns (dict, sha256 of the file bytes as they are on disk)."""
     if path is None:
         return {}, None
     try:
@@ -129,8 +178,9 @@ def load_spec(path):
             raw = fh.read()
     except OSError as exc:
         raise UsageError("cannot read spec file %s: %s" % (path, exc))
+    text = decode_spec_text(raw, path)
     try:
-        spec = json.loads(raw.decode("utf-8"))
+        spec = json.loads(text)
     except RecursionError:
         raise UsageError("spec file %s is nested too deeply to read" % path)
     except ValueError as exc:
@@ -243,16 +293,26 @@ class Report:
         self.commands = []
         self.spec_sha256 = None
 
-    def add(self, check_id, status, expected=None, actual=None, detail="", unmeasured=False):
+    def add(self, check_id, status, expected=None, actual=None, detail="", unmeasured=False, remedy=None):
         """Record one check. `unmeasured=True` (only meaningful with SKIP) marks a check that was asked
-        for, or always runs, and could not be measured because a tool failed or returned nothing. It is
-        kept in the JSON as "unmeasured": true and stops the overall verdict from being PASS. A SKIP
-        that is correct by design (no audio stream, a declared edit judged elsewhere) is not unmeasured."""
+        for, or always runs, and could not be measured because a tool failed, the file records nothing to
+        measure it with, or the file does not allow it. It is kept in the JSON as "unmeasured": true and
+        stops the overall verdict from being PASS. `remedy` (only with unmeasured) is the specific advice
+        run_qa.py prints under "What to do" for that row; without it the general advice is printed.
+        A spec key that was asked for and cannot be measured is never a PASS: it is unmeasured, or a FAIL where
+        the requirement cannot be met at all (an audio limit on a file without audio). That includes
+        max_av_start_offset_s on a file that lacks the audio or the video stream, which is unmeasured. A SKIP that
+        is correct by design is not unmeasured: no video stream, so no video checks; no audio stream when no audio
+        key was asked for; a declared edit judged by `expect`; the same rate in video.fps and gif.fps (judged by
+        rounding_drift); a requested value that makes the check vacuous (video.cfr false; max_av_start_offset_s
+        on a file without audio when the spec itself says audio.present is false)."""
         if status not in (PASS, WARN, FAIL, SKIP):
             raise ValueError("bad status %r" % (status,))
         entry = {"id": check_id, "status": status, "expected": expected, "actual": actual, "detail": detail}
         if unmeasured and status == SKIP:
             entry["unmeasured"] = True
+            if remedy:
+                entry["remedy"] = remedy
         self.checks.append(entry)
 
     def unmeasured_ids(self):
@@ -318,9 +378,9 @@ class Report:
         lines.append(
             "PASS %d  WARN %d  FAIL %d  SKIP %d" % (counts[PASS], counts[WARN], counts[FAIL], counts[SKIP])
         )
-        skipped = [c["id"] for c in self.checks if c["status"] == SKIP]
+        skipped = [c["id"] for c in self.checks if c["status"] == SKIP and not c.get("unmeasured")]
         if skipped:
-            lines.append("Not measured (SKIP, proves nothing): %s" % ", ".join(skipped))
+            lines.append("Skipped, no claim made (SKIP proves nothing): %s" % ", ".join(skipped))
         if self.unmeasured_ids():
             lines.append("NOT MEASURED (a check that applies could not be measured, so the result is not a PASS): %s"
                          % ", ".join(self.unmeasured_ids()))

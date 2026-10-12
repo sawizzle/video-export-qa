@@ -10,7 +10,7 @@ import subprocess
 import sys
 import unittest
 
-from ffmpeg_fixtures import FixturePaths, fixture_command, guarded_fixture, optional_fixture
+from ffmpeg_fixtures import FixturePaths, fixture_command, guarded_fixture, optional_fixture, private_work_folder
 from fractions import Fraction
 from pathlib import Path
 
@@ -18,7 +18,7 @@ sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "packages" / "video-export-qa" / "scripts"
-WORK = ROOT / "_work" / "video-export-qa" / "probe-audio" / "media-probe"
+WORK = Path(private_work_folder(ROOT, "probe-audio", "media-probe"))
 sys.path.insert(0, str(SCRIPTS))
 
 import common  # noqa: E402
@@ -357,6 +357,9 @@ class CfrFileTests(unittest.TestCase):
         report = probe("one_frame")
         self.assertEqual(status(report, "cfr"), "SKIP")
         self.assertIn("at least 2 frames", find(report, "cfr")["detail"])
+        # Negative control for 1.2: a one-frame video has no rate to judge, so this SKIP is by design and is not
+        # NOT MEASURED (unlike a raw stream with many frames and no timestamps).
+        self.assertNotIn("unmeasured", find(report, "cfr"))
 
 
 # --------------------------------------------------------------------------- frame_count_consistent
@@ -441,6 +444,11 @@ class FrameCountTests(unittest.TestCase):
         check = find(report, "frame_count_consistent")
         self.assertEqual(check["status"], "SKIP")
         self.assertIn("would prove nothing", check["detail"])
+        # Changed in 1.2: the check always runs and the file does not allow it, so it is NOT MEASURED and the
+        # overall result cannot be a PASS (in 1.1 the plain SKIP left the overall result at PASS).
+        self.assertTrue(check.get("unmeasured"))
+        self.assertIn("frame_count_consistent", report.unmeasured_ids())
+        self.assertNotEqual(report.overall(), "PASS")
 
     def test_a_container_that_runs_one_audio_frame_past_the_picture_passes(self):
         report = probe("plain_mkv")
@@ -770,6 +778,8 @@ class StartOffsetTests(unittest.TestCase):
             with self.subTest(name):
                 report = probe(name, {"max_av_start_offset_s": 0.05})
                 self.assertEqual(status(report, "max_av_start_offset_s"), "SKIP")
+                # nothing was compared, so the limit that was asked for is NOT MEASURED, never a silent pass
+                self.assertTrue(find(report, "max_av_start_offset_s").get("unmeasured"))
 
 
 class ContainerDurationTests(unittest.TestCase):

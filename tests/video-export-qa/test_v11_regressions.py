@@ -21,7 +21,8 @@ sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "packages" / "video-export-qa" / "scripts"
-WORK = ROOT / "_work" / "video-export-qa" / "v11"
+from ffmpeg_fixtures import private_work_folder  # noqa: E402
+WORK = Path(private_work_folder(ROOT, "v11"))
 sys.path.insert(0, str(SCRIPTS))
 
 import common  # noqa: E402
@@ -224,11 +225,21 @@ class UnmeasuredFlagTests(unittest.TestCase):
         qa_probe.add_av_offset_check(report, True, self.VIDEO, [self.AUDIO], None)
         self.assertTrue(self.row(report, "max_av_start_offset_s").get("unmeasured"))
 
-    def test_audio_video_start_offset_negative_control_a_missing_stream_is_not_flagged(self):
+    def test_audio_video_start_offset_when_a_stream_is_missing_is_not_measured_unless_the_spec_wants_no_audio(self):
+        # 1.2 first left a missing stream as a plain SKIP, so a limit nobody compared ended in Overall PASS.
         report = common.Report("qa_probe.py")
         qa_probe.add_av_offset_check(report, True, self.VIDEO, [], None)
         self.assertEqual(self.row(report, "max_av_start_offset_s")["status"], common.SKIP)
+        self.assertTrue(self.row(report, "max_av_start_offset_s").get("unmeasured"))
+        # negative control: a spec that itself says audio.present is false makes the limit vacuous, a plain SKIP
+        report = common.Report("qa_probe.py")
+        qa_probe.add_av_offset_check(report, True, self.VIDEO, [], None, audio_wanted_absent=True)
+        self.assertEqual(self.row(report, "max_av_start_offset_s")["status"], common.SKIP)
         self.assertNotIn("unmeasured", self.row(report, "max_av_start_offset_s"))
+        # ... but only for a missing AUDIO stream: with the picture missing nothing is vacuous
+        report = common.Report("qa_probe.py")
+        qa_probe.add_av_offset_check(report, True, None, [self.AUDIO], None, audio_wanted_absent=True)
+        self.assertTrue(self.row(report, "max_av_start_offset_s").get("unmeasured"))
 
     def test_compare_identical_when_a_file_decoded_no_frames(self):
         report = common.Report("qa_compare.py")
@@ -273,24 +284,31 @@ class UnmeasuredFlagTests(unittest.TestCase):
         self.assertNotIn("too short", row["detail"])
         self.assertIn("did not report", row["detail"])
 
-    def test_lufs_target_negative_control_no_audio_stream_is_a_skip_by_design(self):
+    def test_lufs_target_negative_control_no_audio_stream_is_a_fail_not_unmeasured(self):
+        # Changed in 1.2: a loudness target that was asked for cannot be met by a file without audio. In 1.1 this
+        # was a SKIP that left the overall result at PASS. It is a FAIL, not "could not be measured": the
+        # requirement is unmet, and nothing is wrong with the tools (test_v12_regressions.py covers every audio key).
         report = common.Report("qa_audio.py")
         qa_audio.add_lufs_check(report, {"lufs_target": -20, "lufs_tol": 1}, None, qa_audio.NO_AUDIO)
-        self.assertEqual(self.row(report, "lufs_target")["status"], common.SKIP)
+        self.assertEqual(self.row(report, "lufs_target")["status"], common.FAIL)
         self.assertNotIn("unmeasured", self.row(report, "lufs_target"))
+        self.assertIn("no audio stream", self.row(report, "lufs_target")["detail"])
 
 
 class ShortAudioEndToEndTests(unittest.TestCase):
     """A 0.3 s clip with a loudness target: loudness cannot be measured, the report must say why and must
     not tell the reader to upgrade ffmpeg as if the tool were at fault."""
 
-    def test_the_report_blames_the_length_and_offers_a_longer_file_or_dropping_the_check(self):
+    def test_the_report_blames_the_length_and_offers_a_longer_file_or_asking_the_user(self):
         code, out, err = run_qa(M["short"], {"lufs_target": -20}, as_json=False)
         self.assertEqual(err, "")
         self.assertEqual(code, 0)
         self.assertIn("NOT MEASURED", out)
         self.assertIn("shorter than 0.4 s", out)
-        self.assertIn("drop that check from the spec", out)
+        # Changed in 1.2: the agent is no longer told to drop the check from the spec on its own.
+        self.assertIn("ask the user whether this requirement can be left out", out)
+        self.assertIn("Never remove a check from the spec yourself", out)
+        self.assertNotIn("drop that check from the spec", out)
 
 
 # --------------------------------------------------------------------------- 2. old ffmpeg
@@ -454,6 +472,32 @@ class ToolLookupTests(unittest.TestCase):
             common.find_tool(self.NAME)
         self.assertIn("current folder is never searched", str(caught.exception))
         self.assertEqual(Path(common.find_tool(self.NAME, override=str(explicit))), explicit)
+
+    def test_the_message_says_so_when_the_only_copy_is_in_the_current_folder_and_that_folder_is_on_PATH(self):
+        # Re-audit: running from FFmpeg's own folder gave "was not found on PATH ... Install FFmpeg", which sent the
+        # reader to install a program that was right there. The folder is on PATH but is never searched.
+        self.make_tool(self.cwd_dir)
+        os.environ["PATH"] = str(self.cwd_dir)
+        os.chdir(str(self.cwd_dir))
+        with self.assertRaises(common.ToolMissing) as caught:
+            common.find_tool(self.NAME)
+        text = str(caught.exception)
+        self.assertIn("was found only in the current folder", text)
+        self.assertIn("the current folder is never searched", text)
+        self.assertIn("not from FFmpeg's own folder", text)
+        self.assertIn("--%s PATH" % self.NAME, text)
+        self.assertNotIn("Install FFmpeg", text)
+
+    def test_control_a_tool_that_is_nowhere_still_gets_the_install_message(self):
+        self.make_tool(self.cwd_dir)   # in the current folder, but the folder is not on PATH
+        os.environ["PATH"] = str(self.path_dir)
+        os.chdir(str(self.cwd_dir))
+        with self.assertRaises(common.ToolMissing) as caught:
+            common.find_tool(self.NAME)
+        text = str(caught.exception)
+        self.assertIn("was not found on PATH", text)
+        self.assertIn("Install FFmpeg", text)
+        self.assertNotIn("found only in the current folder", text)
 
 
 # --------------------------------------------------------------------------- 4. colour codes

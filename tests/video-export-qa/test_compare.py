@@ -22,7 +22,7 @@ import subprocess
 import sys
 import unittest
 
-from ffmpeg_fixtures import fixture_command, supports_option
+from ffmpeg_fixtures import fixture_command, supports_option, private_work_folder
 
 sys.dont_write_bytecode = True  # keep __pycache__ out of the package and the tests
 
@@ -30,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 SCRIPTS = os.path.join(ROOT, "packages", "video-export-qa", "scripts")
 CMP_SCRIPT = os.path.join(SCRIPTS, "qa_compare.py")
-WORK = os.path.join(ROOT, "_work", "video-export-qa", "gif-compare", "compare")
+WORK = private_work_folder(ROOT, "gif-compare", "compare")
 sys.path.insert(0, SCRIPTS)
 
 import common  # noqa: E402

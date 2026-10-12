@@ -52,8 +52,8 @@ KNOWN_CHECK_IDS = {
     "max_silence_s", "no_clipping",
     # qa_frames.py
     "all_frames_decodable", "low_block_margin", "no_dropped_frames", "no_duplicate_frames", "monotonic", "expect",
-    # run_qa.py (compares two parts)
-    "av_duration_match",
+    # run_qa.py (compares two parts; a documented spec key that did not apply)
+    "av_duration_match", "spec_key_not_applied",
     # qa_gif.py
     "frame_count", "duration", "effective_duration", "rounding_drift", "loop",
     # qa_compare.py
@@ -632,7 +632,8 @@ def report_problems(text, shortened_ok=None):
         shortened_ok = "shortened to 12 characters" in text
     if not text.startswith("# Video export QA report\n"):
         problems.append("does not start with the report title")
-    positions = [text.find(h) for h in ("## What was checked", "## Summary", "## Checks", "## Next steps",
+    # What a reader acts on comes first: the verdict line, then Next steps, then the provenance, the counts and the table.
+    positions = [text.find(h) for h in ("## Next steps", "## What was checked", "## Summary", "## Checks",
                                         "## How this report was made")]
     if min(positions) < 0 or positions != sorted(positions):
         problems.append("sections missing or out of order")
@@ -658,7 +659,7 @@ def report_problems(text, shortened_ok=None):
 
 class ExampleTests(unittest.TestCase):
     def test_example_specs_are_valid_json_with_only_known_keys(self):
-        for name in ("spec_h264_1080p24.json", "spec_web_gif.json"):
+        for name in ("spec_h264_1080p24.json", "spec_barcode_run.json", "spec_web_gif.json"):
             with self.subTest(spec=name):
                 spec = json.loads(read_ascii(EXAMPLES / name))
                 run_qa.qa_probe.validate_spec(spec)

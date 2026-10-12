@@ -19,7 +19,13 @@
 #
 # Always-on checks: video_stream, cfr, frame_count_consistent, color_tags.
 # Spec checks run only for keys that are present in the spec.
-# A check that cannot be measured is SKIP with a reason; it is never a PASS.
+# A check that cannot be measured is SKIP with a reason; it is never a PASS. When it applies (a spec key
+# asked for it, or it always runs) and the file does not allow it, it is marked NOT MEASURED, and the
+# overall result is then at best a WARN. Examples: a raw stream has no timestamps (cfr, fps), a file that
+# records no length has nothing to count frames against, a GIF has no frame rate (video.fps).
+# max_av_start_offset_s on a file that lacks the audio or the video stream is NOT MEASURED too: there are not two
+# streams whose start times could be compared. Only a file without audio plus a spec that itself says audio.present
+# is false makes the limit vacuous (the file is meant to have no audio), and then it is a plain SKIP.
 
 import argparse
 import difflib
@@ -68,6 +74,51 @@ FRAME_RATE_UNRELIABLE_CODECS = ("gif",)
 # on every GIF and could never be fixed. For these codecs it is a SKIP unless a spec asks for tags.
 NO_COLOUR_TAG_CODECS = ("gif",)
 
+# Raw elementary streams (no container, ffprobe format_name): they carry no timestamps of their own, so ffprobe
+# makes timestamps up from a frame rate that it assumes or reads from a header inside the stream (for raw H.264
+# and HEVC it gives the frames none at all). For a clip that was really 24 fps, ffmpeg 6.1.1, 7.1, 8.0.1, 8.1.1 and
+# 9.0.1 print an average rate of 25/1 for every format; ffmpeg 4.4.2, 5.1 and 5.1.9 print 24/1 for .h264, .hevc and
+# .m2v (the rate the encoder stored), 0/0 for .m4v, 25/1 or 0/0 for .mjpeg and 25/1 for .obu. Neither the rate nor
+# the spacing it reports was measured from the file.
+# A file of pictures one after another with no container (ffprobe names these png_pipe, jpeg_pipe, webp_pipe and so on,
+# or image2) is the same case: a raw ".mjpeg" file is read as jpeg_pipe on some names. So any name ending in "_pipe"
+# counts too. (ivf and yuv4mpegpipe are not in the list: their headers record a rate and timestamps.)
+RAW_STREAM_FORMATS = (
+    "h264", "hevc", "vvc", "evc", "m4v", "mpegvideo", "mjpeg", "mjpeg_2000", "obu", "av1", "vc1", "dirac",
+    "cavsvideo", "avs2", "avs3", "h261", "h263", "dnxhd", "apv",
+)
+
+# What to do when a check is NOT MEASURED because of the file, not because a tool failed (run_qa.py prints it
+# under "What to do"; the general advice about a newer ffmpeg would not help for these).
+REMEDY_RAW_STREAM = (
+    "Check the container file this stream was taken from (mp4, mov or mkv): a bare stream cannot show what its "
+    "frame rate is or whether it was constant. If only the raw stream exists, tell the user that its frame rate "
+    "cannot be verified from it.")
+REMEDY_NO_TIMESTAMPS = (
+    "Export or remux to a container that records a timestamp for every frame (mp4, mov or mkv) and check that file. "
+    "If this file is all there is, tell the user that its frame rate could not be verified from it.")
+REMEDY_NO_LENGTH = (
+    "Export or remux to a container that records a length (mp4, mov, or a finished Matroska file written to a "
+    "seekable file, not a pipe) and check that file. If this file is all there is, tell the user that its frame "
+    "count could not be cross-checked.")
+REMEDY_IMAGE_FORMAT = (
+    "A still or animated image format records no frame total, so this WARN cannot be cleared for this file "
+    "(it is expected). If the number of frames matters, state it with video.frames in the spec: that is "
+    "measured by decoding.")
+REMEDY_AV_OFFSET_NO_AUDIO = (
+    "Check a file that holds both a picture and a sound track. If this file is meant to have no sound, ask the user "
+    "whether the limit can be left out, or whether the spec should say audio.present is false (the limit is then "
+    "vacuous and is skipped). Never change the user's spec yourself.")
+REMEDY_AV_OFFSET_NO_VIDEO = (
+    "Check a file that holds both a picture and a sound track. A file without a picture is not a video export; "
+    "for an audio-only file use qa_audio.py. Never remove the limit from the user's spec yourself.")
+REMEDY_GIF_FPS = (
+    "Set gif.fps in the spec to the speed the GIF should have (run_qa.py reads it only for a file whose name ends "
+    "in .gif), or run qa_gif.py with --fps, then read rounding_drift.")
+REMEDY_GIF_FPS_DIFFER = (
+    "Give video.fps and gif.fps the same rate: gif.fps is what judges a GIF's speed. Do not remove video.fps "
+    "from the user's spec without asking.")
+
 # Format/stream tags worth showing so embedded provenance is visible.
 TAG_NAMES = ("encoder", "comment", "title", "creation_time")
 
@@ -91,6 +142,43 @@ SIBLING_SPEC_KEYS = (
     "barcode", "gif", "lufs_target", "lufs_tol", "true_peak_max_db",
     "max_leading_silence_s", "max_trailing_silence_s", "max_silence_s", "no_clipping",
 )
+NESTED_SPEC_KEYS = (("video", VIDEO_SPEC_KEYS), ("audio", AUDIO_SPEC_KEYS), ("color", COLOR_SPEC_KEYS))
+
+# A misspelt key is matched to a documented one only when the two are close. 0.75 keeps "widht" -> width
+# and "duration" -> duration_s, and drops matches that point at a different key ("lufs" -> lufs_tol).
+KEY_MATCH_CUTOFF = 0.75
+
+# Words people write for a documented key (lower case, with "_", "-" and spaces taken out), mapped to the key as
+# it is written in a spec. Edit distance alone sends "lufs" to lufs_tol and "framerate" to frames, which is wrong.
+KEY_ALIASES = {
+    "framerate": "video.fps", "framespersecond": "video.fps", "framecount": "video.frames",
+    "numberofframes": "video.frames", "videocodec": "video.codec", "videowidth": "video.width",
+    "videoheight": "video.height", "pixelformat": "video.pix_fmt", "pixelfmt": "video.pix_fmt",
+    "constantframerate": "video.cfr",
+    "audiocodec": "audio.codec", "audiochannels": "audio.channels", "audiosamplerate": "audio.sample_rate",
+    "samplerate": "audio.sample_rate", "audiorate": "audio.sample_rate", "audiopresent": "audio.present",
+    "hasaudio": "audio.present",
+    "colorspace": "color.space", "colourspace": "color.space", "colorrange": "color.range",
+    "colourrange": "color.range", "colortransfer": "color.transfer", "colourtransfer": "color.transfer",
+    "colorprimaries": "color.primaries", "colourprimaries": "color.primaries", "colour": "color",
+    "duration": "duration_s", "length": "duration_s", "durationtolerance": "duration_tol_s",
+    "durationtol": "duration_tol_s",
+    "avoffset": "max_av_start_offset_s", "avsync": "max_av_start_offset_s", "maxavoffset": "max_av_start_offset_s",
+    "avstartoffset": "max_av_start_offset_s",
+    "lufs": "lufs_target", "loudness": "lufs_target", "targetlufs": "lufs_target", "loudnesstarget": "lufs_target",
+    "integratedloudness": "lufs_target", "lufstolerance": "lufs_tol", "lufstol": "lufs_tol",
+    "loudnesstolerance": "lufs_tol",
+    "truepeak": "true_peak_max_db", "peak": "true_peak_max_db", "maxtruepeak": "true_peak_max_db",
+    "truepeakmax": "true_peak_max_db", "maxpeak": "true_peak_max_db",
+    "clipping": "no_clipping", "noclip": "no_clipping", "clip": "no_clipping",
+    "leadingsilence": "max_leading_silence_s", "maxleadingsilence": "max_leading_silence_s",
+    "trailingsilence": "max_trailing_silence_s", "maxtrailingsilence": "max_trailing_silence_s",
+    "silence": "max_silence_s", "maxsilence": "max_silence_s",
+}
+# The same, for a word whose meaning depends on the section it sits in: (section, word).
+SECTION_KEY_ALIASES = {
+    ("video", "rate"): "video.fps", ("audio", "rate"): "audio.sample_rate", ("audio", "hz"): "audio.sample_rate",
+}
 
 
 # --------------------------------------------------------------------------- parsing helpers
@@ -348,7 +436,8 @@ def judge_frame_count(counted, references):
 def add_video_stream_check(report, video, video_count, attached_pictures):
     if video is None:
         note = "only cover art is attached" if attached_pictures else "no video stream in this file"
-        report.add("video_stream", FAIL, "at least one video stream", 0, note)
+        # A video export that lost its picture must fail; an audio-only file is meant for qa_audio.py.
+        report.add("video_stream", FAIL, "at least one video stream", 0, note + " (for an audio-only file use qa_audio.py)")
         return
     detail = "%s %sx%s" % (video["codec"], video["width"], video["height"])
     if video_count > 1:
@@ -370,9 +459,32 @@ def add_cfr_check(report, video, timing, video_spec):
 
 def add_cfr_verdict(report, video, timing, expected):
     stats = analyse_cfr(timing["pts"])
-    if stats is None:
+    counted = timing["counted"] or 0
+    if counted >= 2 and timing.get("raw_stream") and stats is not None:
+        # A raw elementary stream: the timestamps ffprobe lists were made up from a frame rate it assumed or read from
+        # a header inside the stream, so a steady spacing proves nothing about the file. (One frame has no rate to
+        # judge either way.)
         report.add("cfr", SKIP, expected, None,
-                   "needs at least 2 frames with timestamps, found %d" % len(timing["pts"]))
+                   "%d frames decoded from a raw %s stream. A raw stream has no timestamps of its own: ffprobe made "
+                   "these up from a frame rate it assumed or read from a header inside the stream, so constant frame "
+                   "rate was not measured"
+                   % (counted, timing.get("format_name")), unmeasured=True, remedy=REMEDY_RAW_STREAM)
+        return
+    if stats is None:
+        if counted >= 2:
+            # Several frames decoded but (almost) none carries a timestamp: usually a raw stream, whose frames
+            # have none of their own. The frame spacing simply is not recorded, so nothing can be said about it.
+            # One frame (or none) has no rate to judge.
+            have = "only %d has a timestamp" % len(timing["pts"]) if timing["pts"] else "none has a timestamp"
+            why = ("a raw stream has no timestamps of its own" if timing.get("raw_stream")
+                   else "this file does not record enough of them")
+            report.add("cfr", SKIP, expected, None,
+                       "%d frames decoded but %s (%s), so constant frame rate cannot be judged; it needs at "
+                       "least 2 frames with timestamps" % (counted, have, why),
+                       unmeasured=True, remedy=REMEDY_RAW_STREAM if timing.get("raw_stream") else REMEDY_NO_TIMESTAMPS)
+        else:
+            report.add("cfr", SKIP, expected, None,
+                       "needs at least 2 frames with timestamps, found %d" % len(timing["pts"]))
         return
     time_base = as_ratio(video["time_base"])
     unit = float(time_base) if time_base else None
@@ -404,13 +516,24 @@ def add_frame_count_check(report, video, timing, fmt_duration_s, audio_count):
     if counted == 0:
         report.add("frame_count_consistent", FAIL, expected, 0, "no frames decoded from the video stream")
         return
-    references = frame_count_references(video, fmt_duration_s, audio_count)
+    # A raw stream records no length: any duration ffprobe shows for it is its own estimate (and its frame rate is an
+    # assumption, a value stored in the stream or none at all), so nothing it shows can be used to count against.
+    references = [] if timing.get("raw_stream") else frame_count_references(video, fmt_duration_s, audio_count)
     if not references:
+        if not has_real_frame_rate(video):
+            # A GIF has no frame rate, and some ffprobe builds give it no frame total either. qa_gif.py counts
+            # the image frames from the file itself, so this is not a gap in what is measured for a GIF.
+            report.add("frame_count_consistent", SKIP, expected, counted,
+                       "%d frames decoded; a %s file has no real frame rate and this ffprobe recorded no frame "
+                       "total for it, so this check does not apply (qa_gif.py counts the image frames)"
+                       % (counted, str(video["codec"]).upper()))
+            return
         report.add("frame_count_consistent", SKIP, expected, counted,
                    "%d frames decoded but the file records no length to compare with (no nb_frames, no stream "
                    "duration, no DURATION tag, no container duration, or no frame rate). Counting the frames "
-                   "that decode and comparing that with itself would prove nothing, so this is not a PASS"
-                   % counted)
+                   "that decode and comparing that with itself would prove nothing, so this is not a PASS "
+                   "and the check is NOT MEASURED" % counted,
+                   unmeasured=True, remedy=no_length_remedy(timing))
         return
     status = judge_frame_count(counted, references)
     wording = ", ".join("%s %d" % (label, number) for label, number, _slack in references)
@@ -421,6 +544,27 @@ def add_frame_count_check(report, video, timing, fmt_duration_s, audio_count):
                    "frame(s) more than decoded are accepted" % max(loose))
     report.add("frame_count_consistent", status, {label: number for label, number, _slack in references},
                counted, detail)
+
+
+def is_raw_stream(format_name):
+    """True when ffprobe's format_name (it may be a comma list such as "mov,mp4,m4a") is a raw elementary stream or
+    pictures stacked without a container (see RAW_STREAM_FORMATS)."""
+    return any(name in RAW_STREAM_FORMATS or name in ("image2", "image2pipe") or name.endswith("_pipe")
+               for name in str(format_name or "").split(","))
+
+
+def is_image_format(format_name):
+    """True for a still or animated image format (png, apng, jpeg and other single-image demuxers)."""
+    name = str(format_name or "")
+    return name in ("apng", "image2", "image2pipe") or name.endswith("_pipe")
+
+
+def no_length_remedy(timing):
+    """Advice for frame_count_consistent when the file records no length, by what kind of file it is."""
+    format_name = (timing or {}).get("format_name")
+    if is_image_format(format_name):
+        return REMEDY_IMAGE_FORMAT
+    return REMEDY_NO_LENGTH
 
 
 def has_real_frame_rate(video):
@@ -587,31 +731,79 @@ def validate_spec(spec):
         spec_number(spec["max_av_start_offset_s"], "max_av_start_offset_s")
 
 
-def add_unknown_key_warnings(report, spec):
-    nested = {"video": VIDEO_SPEC_KEYS, "audio": AUDIO_SPEC_KEYS, "color": COLOR_SPEC_KEYS}
+def add_unknown_key_warnings(report, spec, gif=False):
+    """One unknown_spec_key row per key the scripts do not know. `gif` is True when the file is a GIF, whose
+    speed is judged by gif.fps and not by video.fps."""
+    nested = dict(NESTED_SPEC_KEYS)
     for key in spec:
         if key in nested:
             for inner in spec_section(spec, key):
                 if inner not in nested[key]:
                     report.add("unknown_spec_key", WARN, "a documented key", "%s.%s" % (key, inner),
                                "not a known key inside %s; allowed: %s%s"
-                               % (key, ", ".join(nested[key]), did_you_mean(inner, nested[key])))
+                               % (key, ", ".join(nested[key]), nested_key_hint(key, inner)))
         elif key not in TOP_SPEC_KEYS and key not in SIBLING_SPEC_KEYS:
-            report.add("unknown_spec_key", WARN, "a documented key", key, unknown_key_hint(key))
+            report.add("unknown_spec_key", WARN, "a documented key", key, unknown_key_hint(key, gif))
 
 
 def did_you_mean(key, candidates):
-    """' (did you mean "duration_s"?)' for the documented key that is nearest to a misspelt one, else ''."""
-    close = difflib.get_close_matches(str(key), list(candidates), n=1)
+    """' (did you mean "duration_s"?)' for the documented key that is close to a misspelt one, else ''.
+    A weak match is left out: no suggestion is better than one that points at a different key."""
+    close = difflib.get_close_matches(str(key), list(candidates), n=1, cutoff=KEY_MATCH_CUTOFF)
     return ' (did you mean "%s"?)' % close[0] if close else ""
 
 
-def unknown_key_hint(key):
-    if key in VIDEO_SPEC_KEYS:
-        return 'not a top-level key; did you mean "video": {"%s": ...}?' % key
-    if key in ("sample_rate", "channels"):
-        return 'not a top-level key; did you mean "audio": {"%s": ...}?' % key
-    return "not a documented key, so it was ignored" + did_you_mean(key, TOP_SPEC_KEYS + SIBLING_SPEC_KEYS)
+def suggest_key(name, section=None):
+    """The documented key that a key `name` most likely means, written as it goes in a spec ("lufs_target",
+    "video.fps"), or None. `section` is the section the key sits in, None at the top level."""
+    for owner, keys in NESTED_SPEC_KEYS:  # a key that belongs inside another section (or at the top level)
+        if owner != section and name in keys:
+            return "%s.%s" % (owner, name)
+    plain = re.sub(r"[\s_-]+", "", str(name).lower())
+    alias = SECTION_KEY_ALIASES.get((section, plain)) or KEY_ALIASES.get(plain)
+    if alias:
+        return alias
+    if section is None:
+        pool = list(TOP_SPEC_KEYS + SIBLING_SPEC_KEYS)
+    else:
+        pool = list(dict(NESTED_SPEC_KEYS)[section])
+    close = difflib.get_close_matches(str(name), pool, n=1, cutoff=KEY_MATCH_CUTOFF)
+    if not close:
+        return None
+    return close[0] if section is None else "%s.%s" % (section, close[0])
+
+
+def key_owners(name):
+    """Every section (video, audio, color) in which `name` is a documented key."""
+    return [owner for owner, keys in NESTED_SPEC_KEYS if name in keys]
+
+
+def unknown_key_hint(key, gif=False):
+    """The detail of an unknown_spec_key row for a top-level key. A name that two sections share ("codec" is both
+    video.codec and audio.codec) names both. For a GIF a top-level frame rate is told to use gif.fps."""
+    owners = key_owners(key)
+    if len(owners) > 1:
+        return 'not a top-level key; did you mean %s?' % " or ".join('"%s": {"%s": ...}' % (o, key) for o in owners)
+    path = suggest_key(key)
+    ignored = "not a documented key, so it was ignored"
+    if path is None:
+        return ignored
+    owner, _dot, name = path.rpartition(".")
+    if owner:  # a key that belongs inside video, audio or color
+        hint = 'not a top-level key; did you mean "%s": {"%s": ...}?' % (owner, name)
+        if gif and path == "video.fps":
+            hint += ' A GIF has no frame rate of its own: its speed is judged by "gif": {"fps": ...} (run_qa.py)'
+        return hint
+    return ignored + ' (did you mean "%s"?)' % path
+
+
+def nested_key_hint(section, inner):
+    """' (did you mean ...?)' for an unknown key `inner` inside the spec section `section`, else ''."""
+    path = suggest_key(inner, section)
+    if path is None:
+        return ""
+    owner, _dot, name = path.rpartition(".")
+    return ' (did you mean "%s"?)' % (name if owner == section else path)
 
 
 # --------------------------------------------------------------------------- spec checks
@@ -622,7 +814,7 @@ def add_equal(report, check_id, expected, actual, equal, detail=""):
     report.add(check_id, PASS if equal else FAIL, expected, actual, detail)
 
 
-def add_video_spec_checks(report, vspec, video, timing):
+def add_video_spec_checks(report, vspec, video, timing, gif_fps=None):
     gone = "" if video else "no video stream"
     for key in ("codec", "pix_fmt"):
         if key in vspec:
@@ -637,7 +829,7 @@ def add_video_spec_checks(report, vspec, video, timing):
     if vspec.get("even_dimensions") is not None and spec_bool(vspec["even_dimensions"], "video.even_dimensions"):
         add_even_dimensions(report, video)
     if "fps" in vspec:
-        add_fps_check(report, vspec["fps"], video)
+        add_fps_check(report, vspec["fps"], video, timing, gif_fps)
     if "frames" in vspec:
         add_frames_check(report, spec_int(vspec["frames"], "video.frames"), video, timing)
 
@@ -667,16 +859,62 @@ def add_even_dimensions(report, video):
                "%dx%d" % (width, height), detail)
 
 
-def add_fps_check(report, raw, video):
+def same_frame_rate(first, second):
+    """Two frame rates that differ by no more than the fps check tolerates (0.001 fps, or 0.01 percent)."""
+    gap = abs(float(first) - float(second))
+    return gap <= 0.001 or gap <= FPS_RELATIVE_TOLERANCE * float(second)
+
+
+def add_gif_fps_row(report, raw, wanted, video, gif_fps):
+    """video.fps for a GIF. A GIF has no frame rate of its own; its speed is judged by qa_gif.py against gif.fps.
+    Without gif.fps (or when it names a different rate) nothing compared the requested rate, so the row is
+    NOT MEASURED; qa_probe.py alone has no GIF speed check at all, so there it always is."""
+    what = "a %s file stores whole-centisecond delays, not a frame rate" % str(video["codec"]).upper()
+    if gif_fps is None:
+        report.add("fps", SKIP, str(raw), None,
+                   what + ", so video.fps is not measured for it. Set gif.fps in the spec (run_qa.py reads it only "
+                   "for a file whose name ends in .gif; rename a GIF that does not), or run qa_gif.py --fps, to "
+                   "judge its speed", unmeasured=True, remedy=REMEDY_GIF_FPS)
+        return
+    _exact, judged = spec_fps(gif_fps, "gif.fps")
+    if same_frame_rate(judged, wanted):
+        report.add("fps", SKIP, str(raw), None,
+                   what + "; its speed is judged by qa_gif.py against gif.fps (see rounding_drift), which is the same rate")
+    else:
+        report.add("fps", SKIP, str(raw), None,
+                   what + "; video.fps is %s but gif.fps is %s, and qa_gif.py judges the speed against gif.fps only, "
+                   "so video.fps was not compared with anything" % (raw, gif_fps),
+                   unmeasured=True, remedy=REMEDY_GIF_FPS_DIFFER)
+
+
+def frames_have_no_timestamps(timing):
+    """True when the frames carry no timestamps of their own: frames decoded but none has one, or the file is a
+    raw elementary stream (ffprobe then makes the timestamps up from a frame rate it assumes or reads from a header
+    inside the stream). One frame with a timestamp, such as a one-frame mp4, is not this case: its container does
+    record a rate."""
+    if not timing or timing.get("error") or (timing.get("counted") or 0) <= 0:
+        return False
+    return bool(timing.get("raw_stream")) or not timing.get("pts")
+
+
+def add_fps_check(report, raw, video, timing=None, gif_fps=None):
     exact, wanted = spec_fps(raw, "video.fps")
     if video is not None and not has_real_frame_rate(video):
-        report.add("fps", SKIP, str(raw), None,
-                   "a %s file stores whole-centisecond delays, not a frame rate; "
-                   "use qa_gif.py --fps (or gif.fps in the spec) to judge its speed" % str(video["codec"]).upper())
+        add_gif_fps_row(report, raw, wanted, video, gif_fps)
         return
     actual = (as_ratio(video["avg_frame_rate"]) or as_ratio(video["r_frame_rate"])) if video else None
-    if actual is None:
+    # A raw stream for which ffprobe prints no rate at all (0/0 twice) is NOT MEASURED like any other raw stream, not a FAIL.
+    raw_without_rate = actual is None and video is not None and bool(timing and timing.get("raw_stream")) and frames_have_no_timestamps(timing)
+    if actual is None and not raw_without_rate:
         report.add("fps", FAIL, str(raw), None, "no video stream" if video is None else "frame rate not reported")
+        return
+    if frames_have_no_timestamps(timing):
+        kind = "a raw %s stream" % timing["format_name"] if timing.get("format_name") else "a raw stream"
+        report.add("fps", SKIP, str(raw), None,
+                   "this file is read as %s (no container), whose frames carry no timestamps of their own, so "
+                   "the frame rate ffprobe prints (%s here) is an assumption, a value stored in the stream or no "
+                   "average rate at all (0/0), never a measurement; the frame rate is not measured"
+                   % (kind, video["avg_frame_rate"]), unmeasured=True, remedy=REMEDY_RAW_STREAM)
         return
     shown = "%s (%.6f)" % (video["avg_frame_rate"], float(actual))
     gap = abs(float(actual) - float(wanted))
@@ -708,7 +946,10 @@ def add_duration_check(report, spec, fmt_info, video, audio_list):
     tol = spec_number(spec.get("duration_tol_s", DEFAULT_DURATION_TOL_S), "duration_tol_s")
     actual = fmt_info["duration_s"]
     if actual is None:
-        report.add("duration_s", SKIP, wanted, None, "the container reports no duration", unmeasured=True)
+        report.add("duration_s", SKIP, wanted, None, "the container reports no duration", unmeasured=True,
+                   remedy="Export or remux to a container that records a duration (mp4, mov, or a finished "
+                          "Matroska file written to a seekable file), or state the length as video.frames, which "
+                          "is measured by decoding.")
         return
     ok = abs(actual - wanted) <= tol + 1e-9
     detail = "container duration; tolerance %.3f s" % tol
@@ -762,7 +1003,10 @@ def other_streams_note(audio_list, key):
     return "first of %d audio streams; the others have %s" % (len(audio_list), others)
 
 
-def add_av_offset_check(report, raw, video, audio_list, offset):
+def add_av_offset_check(report, raw, video, audio_list, offset, audio_wanted_absent=False):
+    """max_av_start_offset_s. `audio_wanted_absent` is True when the same spec says audio.present is false: the file
+    is meant to have no audio, so a limit between audio and video is vacuous and a plain SKIP. Without that, a file
+    that lacks a stream gets NOT MEASURED: the limit was requested and nothing was compared."""
     if raw is False:
         return
     if raw is True:
@@ -770,10 +1014,23 @@ def add_av_offset_check(report, raw, video, audio_list, offset):
     else:
         limit = spec_number(raw, "max_av_start_offset_s")
     if video is None or not audio_list:
-        report.add("max_av_start_offset_s", SKIP, limit, None, "needs both a video stream and an audio stream")
+        if not audio_list and audio_wanted_absent:
+            report.add("max_av_start_offset_s", SKIP, limit, None,
+                       "the spec says audio.present is false and the file has no audio stream, so there is no audio "
+                       "start time to compare and the limit is vacuous")
+            return
+        if not audio_list:
+            what = "no audio stream" if video is not None else "neither a video nor an audio stream"
+            remedy = REMEDY_AV_OFFSET_NO_AUDIO
+        else:
+            what, remedy = "no video stream", REMEDY_AV_OFFSET_NO_VIDEO
+        report.add("max_av_start_offset_s", SKIP, limit, None,
+                   "the file has %s, so there are not two streams to compare and the requested limit was not "
+                   "checked" % what, unmeasured=True, remedy=remedy)
     elif offset is None:
         report.add("max_av_start_offset_s", SKIP, limit, None, "a stream start time is not reported",
-                   unmeasured=True)
+                   unmeasured=True,
+                   remedy="Export to a container that records the start time of each stream (mp4, mov or mkv).")
     else:
         report.add("max_av_start_offset_s", PASS if abs(offset) <= limit + 1e-9 else FAIL, limit, abs(offset),
                    "video start minus audio start = %+.4f s (positive means audio starts first)" % offset)
@@ -781,8 +1038,11 @@ def add_av_offset_check(report, raw, video, audio_list, offset):
 
 # --------------------------------------------------------------------------- orchestration
 
-def analyze(path, spec, tools, spec_sha256=None):
-    """Probe one file and return a common.Report. Used by main() and by run_qa."""
+def analyze(path, spec, tools, spec_sha256=None, gif_fps=None):
+    """Probe one file and return a common.Report. Used by main() and by run_qa.
+
+    gif_fps is the gif.fps value when the caller also judges a GIF's speed against it (run_qa.py does, through
+    qa_gif.py); qa_probe.py alone does not, so video.fps for a GIF is then NOT MEASURED."""
     validate_spec(spec)
     report = common.Report(SCRIPT_NAME, file=path, tools=tools)
     report.spec_sha256 = spec_sha256
@@ -803,6 +1063,9 @@ def analyze(path, spec, tools, spec_sha256=None):
     video = describe_video(real_video[0], timing) if real_video else None
     audio_list = [describe_audio(s) for s in audio_raw]
     fmt_info = describe_format(data.get("format") or {})
+    if timing is not None:  # what kind of file this is decides what its timestamps and lengths are worth
+        timing["format_name"] = fmt_info["format_name"]
+        timing["raw_stream"] = is_raw_stream(fmt_info["format_name"])
     offset = av_start_offset(video, audio_list)
 
     report.info = {
@@ -818,13 +1081,14 @@ def analyze(path, spec, tools, spec_sha256=None):
     add_cfr_check(report, video, timing, video_spec)
     add_frame_count_check(report, video, timing, fmt_info["duration_s"], len(audio_list))
     add_color_check(report, video, {k: v for k, v in color_spec.items() if k in COLOR_SPEC_KEYS})
-    add_unknown_key_warnings(report, spec)
-    add_video_spec_checks(report, video_spec, video, timing)
+    add_unknown_key_warnings(report, spec, gif=bool(video) and not has_real_frame_rate(video))
+    add_video_spec_checks(report, video_spec, video, timing, gif_fps)
     if "duration_s" in spec:
         add_duration_check(report, spec, fmt_info, video, audio_list)
     add_audio_spec_checks(report, audio_spec, audio_list)
     if "max_av_start_offset_s" in spec:
-        add_av_offset_check(report, spec["max_av_start_offset_s"], video, audio_list, offset)
+        add_av_offset_check(report, spec["max_av_start_offset_s"], video, audio_list, offset,
+                            audio_wanted_absent=audio_spec.get("present") is False)
     return report
 
 
@@ -856,6 +1120,11 @@ def build_parser():
     return parser
 
 
+def keys_for_other_scripts(spec):
+    """The keys of `spec` that qa_probe.py does not evaluate because another script reads them."""
+    return [key for key in spec if key in SIBLING_SPEC_KEYS]
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if not os.path.isfile(args.file):
@@ -863,7 +1132,12 @@ def main(argv=None):
     spec, spec_sha = common.load_spec(args.spec)
     report = analyze(args.file, spec, find_tools(args), spec_sha)
     make_stdout_safe()
-    return common.emit(report, args.json)
+    code = common.emit(report, args.json)
+    others = keys_for_other_scripts(spec)
+    if others:  # silent otherwise: a PASS here would read as if the whole spec had been checked
+        print("note: qa_probe.py did not evaluate these spec keys (other scripts read them; run_qa.py checks the "
+              "whole spec): %s" % ", ".join(others), file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":

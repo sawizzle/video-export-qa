@@ -1,7 +1,22 @@
 """Fixture-only ffmpeg compatibility; never adapt commands executed by the product."""
+import atexit
 import functools
+import os
+import shutil
 import subprocess
 import unittest
+import uuid
+
+
+def private_work_folder(root, *parts):
+    """The scratch folder of ONE run of the suite, as text: <root>/_work/video-export-qa/<parts>-<pid>-<random>.
+    A fixed folder is shared by every run, so two runs that overlap (a second terminal, a review running the suite
+    while another run is going) overwrite each other's clips and fail with errors such as "moov atom not found".
+    The module that asks for the folder creates it; it is removed when the run ends."""
+    folder = os.path.join(str(root), "_work", "video-export-qa", *parts[:-1],
+                          "%s-%d-%s" % (parts[-1], os.getpid(), uuid.uuid4().hex[:8]))
+    atexit.register(shutil.rmtree, folder, True)
+    return folder
 
 
 @functools.lru_cache(maxsize=None)

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import unittest
 
-from ffmpeg_fixtures import fixture_command
+from ffmpeg_fixtures import fixture_command, private_work_folder
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = ROOT / "packages" / "video-export-qa"
 SCRIPTS = PACKAGE / "scripts"
 EXAMPLES = PACKAGE / "examples"
-WORK = ROOT / "_work" / "video-export-qa" / "integrator" / "tests-run-qa"
+WORK = Path(private_work_folder(ROOT, "integrator", "tests-run-qa"))
 sys.path.insert(0, str(SCRIPTS))
 
 import common  # noqa: E402
@@ -29,7 +29,9 @@ import run_qa  # noqa: E402
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
 
-SECTIONS = ["# Video export QA report", "## What was checked", "## Summary", "## Checks", "## Next steps",
+# Changed in 1.2: the verdict line and Next steps come before the provenance block and the long tables, so a
+# report that is cut off part-way still carries what a reader acts on.
+SECTIONS = ["# Video export QA report", "## Next steps", "## What was checked", "## Summary", "## Checks",
             "## How this report was made"]
 
 # A spec the plain barcode clip satisfies (the clip is 640x360, 24 fps, 96 frames, a tone at -20.7 LUFS).
@@ -207,7 +209,7 @@ class CorrectExportTests(unittest.TestCase):
         # SKIP rows are counted separately, and the headline says SKIP is not a pass.
         code, md, _err = qa("clip.mp4", "--barcode-expect", "0-95")
         self.assertEqual(code, 0)
-        self.assertIn("SKIP means not measured; it is never a pass", md)
+        self.assertIn("SKIP means no claim is made; it is never a pass", md)
         _code, data = qa_json("clip.mp4", "--barcode-expect", "0-95")
         skipped = [c for c in data["checks"] if c["status"] == "SKIP"]
         self.assertEqual({c["id"] for c in skipped}, {"no_dropped_frames", "no_duplicate_frames", "monotonic"})
@@ -365,7 +367,9 @@ class BarcodeOptionTests(unittest.TestCase):
     def test_a_region_without_an_expectation_is_reported_as_unused(self):
         code, data = qa_json("clip.mp4", "--barcode-region", "0,0.15,1,0.21")
         self.assertEqual(code, 0)
-        warning = one(data, "unknown_spec_key")
+        # Changed in 1.2: barcode.region is a documented key, so it is not an "unknown_spec_key".
+        self.assertNotIn("unknown_spec_key", check_map(data))
+        warning = one(data, "spec_key_not_applied")
         self.assertEqual((warning["status"], warning["actual"]), ("WARN", "barcode.region"))
         self.assertNotIn("expect", check_map(data))
 
@@ -412,6 +416,10 @@ class GifTests(unittest.TestCase):
         check = one(data, "fps")
         self.assertEqual(check["status"], "SKIP")
         self.assertIn("gif.fps", check["detail"])
+        # Changed in 1.2: the speed was asked for and nothing compared it (there is no gif.fps), so it is NOT
+        # MEASURED and the overall result is a WARN, not a clean PASS.
+        self.assertTrue(check.get("unmeasured"))
+        self.assertEqual(data["overall"], "WARN")
 
     def test_the_fps_check_still_fails_for_a_video_with_the_wrong_rate(self):
         # Negative control for the GIF special case: it must not leak into other codecs.
@@ -429,7 +437,9 @@ class GifTests(unittest.TestCase):
     def test_gif_section_in_the_spec_of_a_non_gif_file_is_a_warning(self):
         code, data = qa_json("clip.mp4", "--spec", "spec_gif_on_mp4.json")
         self.assertEqual(code, 0)
-        warning = one(data, "unknown_spec_key")
+        # Changed in 1.2: gif is a documented key, so it is not an "unknown_spec_key".
+        self.assertNotIn("unknown_spec_key", check_map(data))
+        warning = one(data, "spec_key_not_applied")
         self.assertEqual((warning["status"], warning["actual"]), ("WARN", "gif"))
         self.assertNotIn("qa_gif.py", data["info"]["parts_run"])
 
@@ -636,7 +646,7 @@ class MarkdownTests(unittest.TestCase):
         _code, data = qa_json(*args)
         counts = {s: sum(1 for c in data["checks"] if c["status"] == s) for s in ("PASS", "WARN", "FAIL", "SKIP")}
         self.assertIn("| %d | %d | %d | %d |" % (counts["PASS"], counts["WARN"], counts["FAIL"], counts["SKIP"]), md)
-        table = md.split("## Checks")[1].split("## Next steps")[0]
+        table = md.split("## Checks")[1].split("## How this report was made")[0]
         rows = [line for line in table.splitlines() if line.startswith("| ") and "`" in line]
         self.assertEqual(len(rows), len(data["checks"]))
         for row, check in zip(rows, data["checks"]):
@@ -675,8 +685,8 @@ class MarkdownTests(unittest.TestCase):
         report.checks[-1]["source"] = "x.py"
         report.info = {"parts_run": ["x.py"], "notes": []}
         md = run_qa.markdown_report(report.to_dict(), {}, {}, None)
-        table = md.split("## Checks")[1].split("## Next steps")[0]
-        steps = md.split("## Next steps")[1].split("## How this report was made")[0]
+        table = md.split("## Checks")[1].split("## How this report was made")[0]
+        steps = md.split("## Next steps")[1].split("## What was checked")[0]
         self.assertNotIn("e" * 200, table)
         self.assertIn("e" * (run_qa.EXPECTED_ACTUAL_LIMIT - 3) + "...", table)
         self.assertIn("d" * (run_qa.DETAIL_LIMIT - 3) + "...", table)
@@ -686,12 +696,12 @@ class MarkdownTests(unittest.TestCase):
     def test_the_barcode_runs_are_in_the_report_so_a_failed_expectation_shows_what_the_export_holds(self):
         _code, md, _err = qa("dropped.mp4", "--barcode-expect", "0-95")
         self.assertIn("## Barcode runs", md)
-        runs = md.split("## Barcode runs")[1].split("## Next steps")[0]
+        runs = md.split("## Barcode runs")[1].split("## How this report was made")[0]
         self.assertIn("output 0-29 -> source 0-29  (30 frames)", runs)
         self.assertIn("output 30-89 -> source 36-95  (60 frames)", runs)
-        # The section sits between the checks and the next steps.
+        # The section sits after the checks and, since 1.2, after the next steps (which come right after the verdict).
         self.assertLess(md.find("## Checks"), md.find("## Barcode runs"))
-        self.assertLess(md.find("## Barcode runs"), md.find("## Next steps"))
+        self.assertLess(md.find("## Next steps"), md.find("## Barcode runs"))
         # Negative controls: no barcode run, no section; an audio-only file has no runs to show either.
         self.assertNotIn("## Barcode runs", qa("clip.mp4")[1])
         self.assertNotIn("## Barcode runs", qa("audio_only.m4a", "--barcode-expect", "0-95")[1])
@@ -699,7 +709,7 @@ class MarkdownTests(unittest.TestCase):
     def test_the_table_note_says_where_the_complete_text_is(self):
         _code, md, _err = qa("dropped.mp4", "--barcode-expect", "0-95")
         note = md.split("## Checks")[1].split("## Barcode runs")[0]
-        self.assertIn("complete text of every FAIL and WARN is repeated under Next steps", note)
+        self.assertIn("complete text of every FAIL, WARN and NOT MEASURED row is repeated under Next steps", note)
         self.assertIn("report.json", note)
 
     def test_a_report_in_which_nothing_was_measured_says_so_and_is_not_a_pass(self):
@@ -736,7 +746,7 @@ class NextStepsTests(unittest.TestCase):
         args = ("silent.mp4", "--spec", "spec_good.json")
         _code, md, _err = qa(*args)
         _code, data = qa_json(*args)
-        steps = md.split("## Next steps")[1].split("## How this report was made")[0]
+        steps = md.split("## Next steps")[1].split("## What was checked")[0]
         guidance = run_qa.load_guidance()
         failing = [c["id"] for c in data["checks"] if c["status"] in ("FAIL", "WARN")]
         self.assertIn("not_silent", failing)
@@ -749,13 +759,13 @@ class NextStepsTests(unittest.TestCase):
     def test_fails_are_listed_before_warnings(self):
         write_spec("spec_fail_and_warn.json", {"video": {"width": 1920}, "colour": {}})
         _code, md, _err = qa("untagged.mp4", "--spec", "spec_fail_and_warn.json")
-        steps = md.split("## Next steps")[1]
+        steps = md.split("## Next steps")[1].split("## What was checked")[0]
         self.assertLess(steps.find("**width** (FAIL"), steps.find("**color_tags** (WARN"))
         self.assertLess(steps.find("**width** (FAIL"), steps.find("**unknown_spec_key** (WARN"))
 
     def test_a_clean_report_says_there_is_nothing_to_fix(self):
         _code, md, _err = qa("clip.mp4")
-        steps = md.split("## Next steps")[1].split("## How this report was made")[0]
+        steps = md.split("## Next steps")[1].split("## What was checked")[0]
         self.assertIn("Nothing to fix", steps)
         self.assertNotIn("**", steps)
 

@@ -20,7 +20,8 @@ sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "packages" / "video-export-qa" / "scripts"
-WORK = ROOT / "_work" / "video-export-qa" / "integrator" / "tests-hostile"
+from ffmpeg_fixtures import private_work_folder  # noqa: E402
+WORK = Path(private_work_folder(ROOT, "integrator", "tests-hostile"))
 sys.path.insert(0, str(SCRIPTS))
 
 import common  # noqa: E402
@@ -477,10 +478,25 @@ class ReportTableTests(unittest.TestCase):
         report.add("one", "PASS", 1, 1, "")
         report.add("two", "SKIP", None, None, "no audio stream")
         report.add("three", "SKIP", None, None, "no video stream")
-        self.assertIn("Not measured (SKIP, proves nothing): two, three", report.table())
+        self.assertIn("Skipped, no claim made (SKIP proves nothing): two, three", report.table())
         report = common.Report("x.py", file="f.mp4")
         report.add("one", "PASS", 1, 1, "")
-        self.assertNotIn("Not measured", report.table())
+        self.assertNotIn("Skipped, no claim made", report.table())
+
+    def test_the_line_these_controls_look_for_is_the_line_the_product_prints(self):
+        # The controls above and in test_gif.py assertNotIn the Skipped line. A control that looks for text the product
+        # no longer prints can never fail (the old wording was "Not measured (SKIP, proves nothing)"), so pin the wording.
+        report = common.Report("x.py", file="f.mp4")
+        report.add("one", "PASS", 1, 1, "")
+        report.add("two", "SKIP", None, None, "no audio stream")
+        table = report.table()
+        self.assertIn("Skipped, no claim made (SKIP proves nothing): two", table)
+        self.assertNotIn("Not measured", table)
+        report.add("three", "SKIP", None, None, "could not be measured", unmeasured=True)
+        table = report.table()
+        lines = table.splitlines()
+        self.assertIn("Skipped, no claim made (SKIP proves nothing): two", lines)   # a whole line: "three" is not on it
+        self.assertIn("NOT MEASURED (a check that applies could not be measured, so the result is not a PASS): three", lines)
 
 
 # --------------------------------------------------------------------------- playlists

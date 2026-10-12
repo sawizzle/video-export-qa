@@ -4,7 +4,7 @@
 # Purpose: prove the barcode writer and reader agree, that the reader survives realistic
 #          re-encoding, and that it refuses damaged or mirrored barcodes (negative controls).
 # Inputs:  none. Needs ffmpeg and ffprobe on PATH. Media is generated, never copied.
-# Outputs: test results on stderr; generated media under _work/video-export-qa/barcode-frames/test_barcode/.
+# Outputs: test results on stderr; generated media under a per-run folder in _work/video-export-qa/barcode-frames/.
 # Run:     python -I -B -m unittest discover -s tests/video-export-qa -p "test_barcode.py"
 # Exit codes: 0 = all tests passed, 1 = a test failed.
 
@@ -20,7 +20,8 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 SCRIPTS = os.path.join(ROOT, "packages", "video-export-qa", "scripts")
-WORK = os.path.join(ROOT, "_work", "video-export-qa", "barcode-frames", "test_barcode")
+from ffmpeg_fixtures import private_work_folder  # noqa: E402
+WORK = private_work_folder(ROOT, "barcode-frames", "test_barcode")
 sys.path.insert(0, SCRIPTS)
 
 import barcode  # noqa: E402

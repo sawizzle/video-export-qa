@@ -64,7 +64,7 @@ def parse_region(text):
     if text is None:
         return barcode.DEFAULT_REGION
     problem = (
-        "--region must be four fractions of the frame, x0,y0,x1,y1, with 0 <= x0 < x1 <= 1 and "
+        "--region (run_qa.py: --barcode-region) must be four fractions of the frame, x0,y0,x1,y1, with 0 <= x0 < x1 <= 1 and "
         "0 <= y0 < y1 <= 1 (default 0,0,1,0.0833); got %r" % text
     )
     parts = text.split(",")
@@ -185,7 +185,7 @@ def decode_video(ffmpeg, path, region, commands):
         if "non positive size" in decoded.stderr:
             hint = (" Hint: the barcode strip is thinner than one pixel row at this frame size (the default strip is "
                     "8.33 percent of the height, so a 4:2:0 frame under about 20 rows high cannot be cropped). "
-                    "Use a larger export, or pass --region with a taller area")
+                    "Use a larger export, or give a taller area with --region (run_qa.py: --barcode-region)")
         raise QAError("ffmpeg could not decode %s (exit code %d): %s%s" % (path, decoded.returncode, tail, hint))
     return decoded
 

@@ -394,13 +394,17 @@ def _check_effective_duration(report, info, expect_duration, tol):
                 "effective duration %.2f s differs from the expected %.2f s by %+.3f s"
                 % (effective, expect_duration, effective - expect_duration)
             )
-    expected = expect_duration if expect_duration is not None else nominal
+    # Expected and Measured describe what this check tests (frames a browser slows down), never a length: the
+    # written and the played length are in the detail, and `duration` is the check that compares a length
+    # with --expect-duration. (A PASS row that put 3.0 next to 2.0 contradicted itself.)
+    condition = "no frame with a delay of 0 or 1 cs"
     if problems:
-        report.add("effective_duration", common.WARN, expected, effective, "; ".join(problems))
+        report.add("effective_duration", common.WARN, condition, slow, "; ".join(problems))
     else:
         report.add(
-            "effective_duration", common.PASS, expected, effective,
-            "no frame has a delay of 0 or 1 cs, so browsers play the written %.2f s" % nominal,
+            "effective_duration", common.PASS, condition, 0,
+            "no frame has a delay of 0 or 1 cs, so browsers play the written %.2f s (this check looks only for "
+            "such frames; the duration check compares the length with the expected one)" % nominal,
         )
 
 

@@ -19,14 +19,16 @@
 # Exit codes: 0 = PASS or WARN only, 1 = at least one FAIL, 2 = could not run.
 #
 # Every audio stream is analysed (one ffmpeg pass each). The top-level info values and the
-# spec checks use the first audio stream; not_silent covers all of them. With no audio
-# stream, every audio check is SKIP ("no audio stream"), which is not an error.
-# A measurement that returned nothing is SKIP, never PASS.
+# spec checks use the first audio stream; not_silent covers all of them.
+# With no audio stream and no spec key that needs audio, the one always-on check (not_silent) is
+# SKIP ("no audio stream"), which is not an error. A spec key that needs audio (lufs_target,
+# true_peak_max_db, no_clipping, max_silence_s, max_leading_silence_s, max_trailing_silence_s) on a
+# file without audio is a FAIL: the requirement cannot be met.
+# A measurement that returned nothing is SKIP and NOT MEASURED, never PASS.
 # Note: a length difference between picture and sound can be entirely leading or
 # trailing silence, so silence is reported separately and never called a sync failure.
 
 import argparse
-import difflib
 import json
 import math
 import os
@@ -67,7 +69,8 @@ MIN_LOUDNESS_S = 0.4
 # there reads -70 LUFS too. If the mean volume is above this level the stream holds sound that the
 # loudness meter did not count, and it is reported as a WARN, not called silent.
 SIGNAL_PRESENT_DB = -60.0
-# A true peak at or above this is treated as clipping.
+# The no_clipping ceiling: a true peak at or above this fails. It is a ceiling on the true peak, not a
+# detector of clipped samples (audio that was clipped earlier and then lowered is not found).
 CLIP_DBTP = -0.1
 # How close a silent run must be to the start or end of the audio to count as leading/trailing.
 EDGE_TOLERANCE_S = 0.05
@@ -377,11 +380,20 @@ def unusable_reason(primary):
     return None
 
 
+def add_no_audio_failure(report, check_id, expected):
+    """A requirement the spec put on audio that the file does not have is not met: FAIL, like
+    audio.sample_rate in qa_probe.py. (Without such a key, a file without audio only SKIPs not_silent.)"""
+    report.add(check_id, FAIL, expected, None, "no audio stream, so the requested %s cannot be met" % check_id)
+
+
 def add_limit_check(report, check_id, limit, actual, reason, what):
-    """PASS when the measured value is at or below the limit; SKIP when it was not measured."""
+    """PASS when the measured value is at or below the limit; FAIL when it is over it or when the file has
+    no audio; SKIP and NOT MEASURED when the audio could not be measured."""
+    if reason == NO_AUDIO:
+        add_no_audio_failure(report, check_id, limit)
+        return
     if reason or actual is None:
-        report.add(check_id, SKIP, limit, None, reason or "%s was not reported" % what,
-                   unmeasured=(reason != NO_AUDIO))
+        report.add(check_id, SKIP, limit, None, reason or "%s was not reported" % what, unmeasured=True)
         return
     ok = actual <= limit + EPSILON
     verdict = "within the limit" if ok else "over the limit"
@@ -391,12 +403,17 @@ def add_limit_check(report, check_id, limit, actual, reason, what):
 def add_lufs_check(report, values, primary, reason):
     target, tol = values["lufs_target"], values["lufs_tol"]
     expected = {"target": target, "tol": tol}
-    if reason:
-        report.add("lufs_target", SKIP, expected, None, reason, unmeasured=(reason != NO_AUDIO))
+    if reason == NO_AUDIO:
+        add_no_audio_failure(report, "lufs_target", expected)
+    elif reason:
+        report.add("lufs_target", SKIP, expected, None, reason, unmeasured=True)
     elif not loudness_measurable(primary):
         report.add("lufs_target", SKIP, expected, None,
                    "integrated loudness is not defined for audio shorter than 0.4 s, so the file is too short "
-                   "for this check", unmeasured=True)
+                   "for this check", unmeasured=True,
+                   remedy="Use a file with at least 0.4 s of audio, or ask the user whether this requirement can "
+                          "be left out. Never remove a check from the spec yourself: if the user agrees, say in the "
+                          "verdict line that the check was removed and that its requirement was not verified.")
     elif primary["integrated_lufs"] is None:
         report.add("lufs_target", SKIP, expected, None,
                    "ffmpeg's loudness filter did not report an integrated loudness for this stream", unmeasured=True)
@@ -408,15 +425,23 @@ def add_lufs_check(report, values, primary, reason):
 
 
 def add_clipping_check(report, primary, reason):
-    expected = "true peak below %.1f dBTP" % CLIP_DBTP
+    """no_clipping is a ceiling on the true peak (CLIP_DBTP), nothing more: a signal at or above it has no
+    headroom (clip risk). It does not look for flat-topped samples, so audio that was clipped earlier and then
+    lowered passes. ffmpeg prints the true peak with one decimal, so the practical cutoff is about -0.15 dBTP."""
+    expected = "true peak below the %.1f dBTP ceiling" % CLIP_DBTP
+    if reason == NO_AUDIO:
+        add_no_audio_failure(report, "no_clipping", expected)
+        return
     peak = None if reason else primary["true_peak_dbtp"]
     if reason or peak is None:
-        report.add("no_clipping", SKIP, expected, None, reason or "true peak was not reported",
-                   unmeasured=(reason != NO_AUDIO))
+        report.add("no_clipping", SKIP, expected, None, reason or "true peak was not reported", unmeasured=True)
         return
-    clipped = peak >= CLIP_DBTP
-    report.add("no_clipping", FAIL if clipped else PASS, expected, jsonable(peak),
-               "true peak %.1f dBTP" % peak + (": at or above full scale, the audio clips" if clipped else ""))
+    if peak >= CLIP_DBTP:
+        report.add("no_clipping", FAIL, expected, jsonable(peak),
+                   "true peak %.1f dBTP is at or above the %.1f dBTP ceiling (clip risk)" % (peak, CLIP_DBTP))
+    else:
+        report.add("no_clipping", PASS, expected, jsonable(peak),
+                   "true peak %.1f dBTP, below the %.1f dBTP ceiling" % (peak, CLIP_DBTP))
 
 
 # Checks of the form "measured value must not exceed the limit": (spec key, measurement field, label).
@@ -465,9 +490,7 @@ def add_unknown_key_warnings(report, spec):
     for key in spec:
         if key in SPEC_KEYS or key in SIBLING_SPEC_KEYS:
             continue
-        close = difflib.get_close_matches(key, SPEC_KEYS, n=1)
-        hint = 'not a documented key, so it was ignored' + (' (did you mean "%s"?)' % close[0] if close else "")
-        report.add("unknown_spec_key", WARN, "a documented key", key, hint)
+        report.add("unknown_spec_key", WARN, "a documented key", key, qa_probe.unknown_key_hint(key))
 
 
 # --------------------------------------------------------------------------- orchestration
@@ -523,6 +546,11 @@ def build_parser():
     return parser
 
 
+def keys_for_other_scripts(spec):
+    """The keys of `spec` that qa_audio.py does not evaluate because another script reads them."""
+    return [key for key in spec if key in SIBLING_SPEC_KEYS]
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if not os.path.isfile(args.file):
@@ -530,7 +558,13 @@ def main(argv=None):
     spec, spec_sha = common.load_spec(args.spec)
     report = analyze(args.file, spec, find_tools(args), spec_sha)
     qa_probe.make_stdout_safe()
-    return common.emit(report, args.json)
+    code = common.emit(report, args.json)
+    others = keys_for_other_scripts(spec)
+    if others:  # silent otherwise: a PASS here would read as if the whole spec had been checked
+        print("note: qa_audio.py did not evaluate these spec keys (other scripts read them; run_qa.py checks the "
+              "whole spec; the audio format of a file is listed by qa_probe.py --json under info): %s"
+              % ", ".join(others), file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":

@@ -30,7 +30,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 SCRIPTS = os.path.join(ROOT, "packages", "video-export-qa", "scripts")
 GIF_SCRIPT = os.path.join(SCRIPTS, "qa_gif.py")
-WORK = os.path.join(ROOT, "_work", "video-export-qa", "gif-compare", "gif")
+from ffmpeg_fixtures import private_work_folder  # noqa: E402
+WORK = private_work_folder(ROOT, "gif-compare", "gif")
 sys.path.insert(0, SCRIPTS)
 
 import common  # noqa: E402
@@ -603,8 +604,8 @@ class RoundingDrift(unittest.TestCase):
 
     def test_the_table_lists_what_was_not_measured(self):
         text = qa_gif.build_report(F["g24"]).table()
-        self.assertIn("Not measured (SKIP, proves nothing): duration, rounding_drift", text)
-        self.assertNotIn("Not measured", qa_gif.build_report(F["g24"], fps=24, expect_duration=1.0).table())
+        self.assertIn("Skipped, no claim made (SKIP proves nothing): duration, rounding_drift", text)
+        self.assertNotIn("Skipped, no claim made", qa_gif.build_report(F["g24"], fps=24, expect_duration=1.0).table())
 
     def test_a_held_last_frame_is_a_warning_not_the_rounding_signature(self):
         delays = [4] * 23 + [200]                              # intentional two-second hold at the end

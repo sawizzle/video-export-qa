@@ -17,7 +17,8 @@ sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "packages" / "video-export-qa" / "scripts"
-WORK = ROOT / "_work" / "video-export-qa" / "probe-audio" / "media-audio"
+from ffmpeg_fixtures import private_work_folder  # noqa: E402
+WORK = Path(private_work_folder(ROOT, "probe-audio", "media-audio"))
 sys.path.insert(0, str(SCRIPTS))
 
 import common  # noqa: E402
@@ -536,16 +537,29 @@ class SilentExportTests(unittest.TestCase):
 
 
 class NoAudioTests(unittest.TestCase):
-    def test_every_check_is_skip_with_the_reason_and_it_is_not_an_error(self):
+    def test_a_requested_audio_key_is_a_fail_and_the_always_on_check_is_a_skip(self):
+        # Changed in 1.2 (in 1.1 all seven rows were SKIP and the overall result was a clean pass): a limit that was
+        # asked for cannot be met by a file that has no audio, the same way qa_probe.py fails audio.sample_rate.
+        # Only not_silent, which nobody asked for, stays a SKIP "no audio stream".
         report = measure("no_audio", {"lufs_target": -23, "true_peak_max_db": -1, "max_leading_silence_s": 1,
                                       "max_trailing_silence_s": 1, "max_silence_s": 1, "no_clipping": True})
-        for check in report.checks:
-            self.assertEqual(check["status"], "SKIP", check["id"])
-            self.assertEqual(check["detail"], "no audio stream")
         self.assertEqual(len(report.checks), 7)
-        self.assertEqual(report.exit_code(), 0)
+        for check in report.checks:
+            if check["id"] == "not_silent":
+                self.assertEqual((check["status"], check["detail"]), ("SKIP", "no audio stream"))
+            else:
+                self.assertEqual(check["status"], "FAIL", check["id"])
+                self.assertEqual(check["detail"], "no audio stream, so the requested %s cannot be met" % check["id"])
+        self.assertEqual(report.overall(), "FAIL")
+        self.assertEqual(report.exit_code(), 1)
         self.assertEqual(report.info["audio_stream_count"], 0)
         self.assertIsNone(report.info["integrated_lufs"])
+
+    def test_negative_control_without_a_spec_every_check_is_skip_and_it_is_not_an_error(self):
+        report = measure("no_audio")
+        self.assertEqual([c["status"] for c in report.checks], ["SKIP"])
+        self.assertEqual(report.checks[0]["detail"], "no audio stream")
+        self.assertEqual(report.exit_code(), 0)
 
     def test_when_nothing_was_measured_the_overall_result_is_skip_never_pass(self):
         # Hard rule: nothing is printed as PASS that was not measured. All checks SKIP means no PASS.
@@ -556,7 +570,7 @@ class NoAudioTests(unittest.TestCase):
         text = report.table()
         self.assertIn("qa_audio.py: SKIP", text.splitlines()[0])
         self.assertIn("Nothing was measured", text)
-        self.assertIn("Not measured (SKIP, proves nothing): not_silent", text)
+        self.assertIn("Skipped, no claim made (SKIP proves nothing): not_silent", text)
 
     def test_negative_control_one_real_measurement_makes_the_overall_result_a_pass_again(self):
         self.assertEqual(measure("tone_stereo_wav").overall(), "PASS")

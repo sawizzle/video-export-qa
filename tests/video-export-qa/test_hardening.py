@@ -12,13 +12,13 @@ import sys
 import unittest
 from pathlib import Path
 
-from ffmpeg_fixtures import supports_option
+from ffmpeg_fixtures import supports_option, private_work_folder
 
 sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "packages" / "video-export-qa" / "scripts"
-WORK = ROOT / "_work" / "video-export-qa" / "integrator" / "tests-hardening"
+WORK = Path(private_work_folder(ROOT, "integrator", "tests-hardening"))
 sys.path.insert(0, str(SCRIPTS))
 
 import common  # noqa: E402

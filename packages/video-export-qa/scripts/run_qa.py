@@ -5,9 +5,12 @@
 #          qa_audio.py (loudness, silence), optionally qa_frames.py (which source frame sits
 #          on every output frame, when a barcode clip was exported) and, for a file whose name
 #          ends in .gif, qa_gif.py (frame delays, duration, loop). The results are merged into
-#          one Markdown report: provenance header, PASS/WARN/FAIL/SKIP counts, one row per
-#          check, then "Next steps" for every FAIL, WARN and NOT MEASURED check, taken from the
-#          table in references/interpreting-results.md.
+#          one Markdown report. Order: the Overall verdict line, then "Next steps" (one entry for
+#          every FAIL, WARN and NOT MEASURED row; the causes and fixes of a FAIL or WARN row come from the
+#          table in references/interpreting-results.md, a NOT MEASURED row gets the advice its check
+#          recorded or a general text), then the provenance block, the PASS/WARN/FAIL/SKIP
+#          counts, one row per check, the barcode runs and the commands that were run. What a
+#          reader acts on comes first, so a report that is cut off part-way still carries it.
 # Inputs:  FILE                    the exported video, audio or GIF to check
 #          --spec SPEC.json        expectations (optional). Keys of qa_probe.py and qa_audio.py
 #                                  work as documented there. Two extra sections drive the other
@@ -27,7 +30,8 @@
 #          (missing tool, unreadable input, bad spec or arguments, output file exists).
 #
 # Rules: standard library only, no environment reads except PATH, no network, argument-list subprocess only
-# (inside the parts). A check that was not measured is SKIP and is never counted as a PASS.
+# (inside the parts). A check that was not measured is SKIP and is never counted as a PASS; one that applies
+# and could not be measured is NOT MEASURED, and the overall result is then at best a WARN.
 
 import argparse
 import json
@@ -170,15 +174,16 @@ def run_parts(path, spec, spec_sha, tools, barcode_expect, barcode_region):
     is_gif = path.lower().endswith(".gif")
     extra_checks = []
     for name in gif_unknown:
-        extra_checks.append(unknown_key_check(name, "keys inside gif: " + ", ".join(GIF_SPEC_KEYS)))
+        extra_checks.append(unknown_key_check(name, "keys inside gif: " + ", ".join(GIF_SPEC_KEYS), GIF_SPEC_KEYS))
     if "gif" in spec and not is_gif:
-        extra_checks.append({
-            "id": "unknown_spec_key", "status": WARN, "expected": "a file whose name ends in .gif",
-            "actual": "gif", "detail": "the gif section applies only to .gif files; this file was not checked as a GIF",
-        })
+        extra_checks.append(not_applied_check(
+            "gif", "a file whose name ends in .gif",
+            "it applies only to files whose name ends in .gif; this file was not checked as a GIF (a real GIF "
+            "with another name needs renaming first)"))
 
     parts = []
-    probe = qa_probe.analyze(path, spec, tools, spec_sha)
+    # gif.fps is what judges a GIF's speed (qa_gif.py, below), so qa_probe is told whether it was given.
+    probe = qa_probe.analyze(path, spec, tools, spec_sha, gif_fps=gif_options.get("fps") if is_gif else None)
     parts.append(Part(qa_probe.SCRIPT_NAME, probe, "qa_probe.py"))
     audio = qa_audio.analyze(path, spec, tools, spec_sha)
     parts.append(Part(qa_audio.SCRIPT_NAME, audio, "qa_audio.py"))
@@ -199,10 +204,22 @@ def run_parts(path, spec, spec_sha, tools, barcode_expect, barcode_region):
     return parts, extra_checks
 
 
-def unknown_key_check(name, hint):
+def unknown_key_check(name, hint, candidates=()):
+    """A key inside the gif or barcode section that no script knows. The nearest documented key is named when
+    it is close; `name` looks like "gif.fpss"."""
+    suggestion = qa_probe.did_you_mean(name.split(".", 1)[-1], candidates)
     return {
         "id": "unknown_spec_key", "status": WARN, "expected": "a documented key", "actual": name,
-        "detail": "not a documented key, so it was ignored (%s)" % hint,
+        "detail": "not a documented key, so it was ignored%s; %s" % (suggestion, hint),
+    }
+
+
+def not_applied_check(name, expected, why):
+    """A documented key that did not apply to this file. It is a WARN under its own id, never an
+    unknown_spec_key: the key is documented, so calling it unknown would send the reader to look for a typo."""
+    return {
+        "id": "spec_key_not_applied", "status": WARN, "expected": expected, "actual": name,
+        "detail": "%s is a documented key, but %s" % (name, why),
     }
 
 
@@ -228,10 +245,11 @@ def merge(path, tools, spec_sha, parts, extra_checks, notes):
             merged.checks.append(row)
         merged.commands.extend(part.report.commands)
     for check in extra_checks:
-        key = json.dumps(check["actual"], sort_keys=True)
-        if check["id"] == "unknown_spec_key" and key in seen_unknown:
-            continue
-        seen_unknown.add(key)
+        if check["id"] == "unknown_spec_key":
+            key = json.dumps(check["actual"], sort_keys=True)
+            if key in seen_unknown:
+                continue
+            seen_unknown.add(key)
         row = dict(check)
         row["source"] = SCRIPT_NAME
         merged.checks.append(row)
@@ -325,18 +343,22 @@ def markdown_report(data, guidance, tools, spec_name):
     counts = count_statuses(checks)
     source = prov.get("input") or {}
     out = ["# Video export QA report", ""]
-    out.append("**Overall: %s** - %d PASS, %d WARN, %d FAIL, %d SKIP (SKIP means not measured; it is never a pass)."
+    out.append("**Overall: %s** - %d PASS, %d WARN, %d FAIL, %d SKIP (SKIP means no claim is made; it is never a pass)."
                % (data["overall"], counts[PASS], counts[WARN], counts[FAIL], counts[SKIP]))
     unmeasured = [c["id"] for c in checks if c.get("unmeasured")]
     if unmeasured:
         out += ["", "**NOT MEASURED: some checks that apply could not be measured: %s.** The result is at best a WARN, "
                     "never a PASS, because part of the file was not checked. The reason is in the Detail column "
-                    "(for example an ffmpeg that is too old or built without a filter, or a file too short or "
-                    "damaged for that measurement)."
+                    "(for example an ffmpeg that is too old or built without a filter, a file too short or "
+                    "damaged for that measurement, or a file that records no timestamps or length)."
                 % ", ".join("`%s`" % name for name in unmeasured)]
     if data["overall"] == SKIP:
         out += ["", "**Nothing was measured: every check was skipped, so this report proves nothing.** "
                     "The reasons are in the Detail column."]
+    # The verdict above and Next steps here come first: a report that is cut off part-way (a tool that keeps only
+    # the first part of a long output) still carries what a reader acts on. Nothing is left out, only moved.
+    out += ["", "## Next steps", ""] + next_steps(checks, guidance)
+
     out += ["", "## What was checked", "", table_row(["Item", "Value"]), table_row(["---", "---"])]
     rows = [
         ("File", data["file"]),
@@ -364,15 +386,14 @@ def markdown_report(data, guidance, tools, spec_name):
             shorten(show_value(check["actual"]), EXPECTED_ACTUAL_LIMIT),
             shorten(("NOT MEASURED: " if check.get("unmeasured") else "") + (check["detail"] or "-"), DETAIL_LIMIT),
         ]))
-    out += ["", "Long values are shortened in this table. The complete text of every FAIL and WARN is repeated under "
-                "Next steps, and report.json (with --out-dir) keeps everything whole."]
+    out += ["", "Long values are shortened in this table. The complete text of every FAIL, WARN and NOT MEASURED row is "
+                "repeated under Next steps (above), and report.json (with --out-dir) keeps everything whole."]
     if "runs" in (data["info"].get("qa_frames") or {}):  # absent when the file had no video to read
         out += ["", "## Barcode runs", "",
                 "Which source frame sits on which output frame, read from the barcode on every frame "
                 "(output frame numbers and source frame numbers both start at 0):", "", "```"]
         out += qa_frames.runs_lines(data["info"]["qa_frames"]) + ["```"]
 
-    out += ["", "## Next steps", ""] + next_steps(checks, guidance)
     out += ["", "## How this report was made", "",
             "Commands that were run (tool and file paths shortened; the exact argument lists are in report.json):", ""]
     commands = display_commands(prov["commands"], data["file"], tools)
@@ -381,32 +402,36 @@ def markdown_report(data, guidance, tools, spec_name):
 
 
 def next_steps(checks, guidance):
-    """One entry per FAIL, WARN or unmeasured check id, FAILs first. PASS and a SKIP that is correct by
-    design need no action; a SKIP that applies but could not be measured is listed last."""
+    """One entry per FAIL, WARN or unmeasured row, FAILs first (so every unknown spec key has its own entry
+    and nothing is left out). PASS and a SKIP that is correct by design need no action; a SKIP that applies but
+    could not be measured is listed last."""
     ordered = ([c for c in checks if c["status"] == FAIL] + [c for c in checks if c["status"] == WARN]
                + [c for c in checks if c.get("unmeasured")])
     if not ordered and not any(c["status"] == PASS for c in checks):
         return ["Nothing was measured: every check was skipped. Read the reasons in the Detail column."]
     if not ordered:
-        return ["Nothing to fix: no check failed or warned. Checks marked SKIP were not measured and prove nothing."]
-    lines, done = [], set()
-    for check in ordered:
-        if check["id"] in done:
-            continue
-        done.add(check["id"])
+        return ["Nothing to fix: no check failed or warned. Checks marked SKIP made no claim and prove nothing."]
+    lines = []
+    for number, check in enumerate(ordered, 1):
         entry = guidance.get(check["id"])
         label = "NOT MEASURED" if check.get("unmeasured") else check["status"]
-        lines.append("%d. **%s** (%s, from %s)" % (len(done), check["id"], label, check["source"]))
+        lines.append("%d. **%s** (%s, from %s)" % (number, check["id"], label, check["source"]))
         lines.append("   - Measured: %s" % clean(show_value(check["actual"])))
         if check["expected"] is not None:
             lines.append("   - Expected: %s" % clean(show_value(check["expected"])))
         if check["detail"]:
             lines.append("   - Detail: %s" % clean(check["detail"]))
-        if check.get("unmeasured"):
+        if check.get("unmeasured") and check.get("remedy"):
+            # The cause is the file, not a tool: the advice written for that cause, not "try a newer ffmpeg".
+            lines.append("   - What to do: %s" % clean(check["remedy"]))
+        elif check.get("unmeasured"):
             lines.append("   - What to do: this check could not be measured, so nothing is known about it. Read the "
-                         "Detail for the cause. If a tool failed, run `ffmpeg -version` and run again with a newer "
-                         "ffmpeg (`--ffmpeg PATH --ffprobe PATH`). If the file does not allow the measurement "
-                         "(for example audio shorter than 0.4 s), use a file that does or drop that check from the spec.")
+                         "Detail for the cause and for what would make it measurable. If a tool failed, run "
+                         "`ffmpeg -version` and run again with a newer ffmpeg (`--ffmpeg PATH --ffprobe PATH`). If the "
+                         "file does not allow the measurement (for example audio shorter than 0.4 s), use a file that "
+                         "does, or ask the user whether this requirement can be left out. Never remove a check from "
+                         "the spec yourself: if the user agrees, say in the verdict line that the check was removed "
+                         "and that its requirement was not verified.")
         elif entry:
             lines.append("   - Likely causes: %s" % entry["causes"])
             lines.append("   - What to do: %s" % entry["action"])
@@ -495,11 +520,12 @@ def main(argv=None):
         notes.append("--barcode-expect was given, so barcode.expect in the spec was not used")
     parts, extra_checks = run_parts(args.file, spec, spec_sha, tools, expect, region)
     for name in barcode_unknown:
-        extra_checks.append(unknown_key_check(name, "keys inside barcode: " + ", ".join(BARCODE_SPEC_KEYS)))
+        extra_checks.append(unknown_key_check(name, "keys inside barcode: " + ", ".join(BARCODE_SPEC_KEYS),
+                                              BARCODE_SPEC_KEYS))
     if region is not None and expect is None:
-        extra_checks.append(unknown_key_check(
-            "barcode.region", "no barcode expectation was given (barcode.expect or --barcode-expect), "
-                              "so the barcode was not read"))
+        extra_checks.append(not_applied_check(
+            "barcode.region", "a barcode expectation (barcode.expect or --barcode-expect)",
+            "no barcode expectation was given (barcode.expect or --barcode-expect), so the barcode was not read"))
     merged = merge(args.file, tools, spec_sha, parts, extra_checks, notes)
 
     data = merged.to_dict()

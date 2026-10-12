@@ -1,0 +1,24 @@
+{
+  "video": {
+    "codec": "h264",
+    "pix_fmt": "yuv420p",
+    "width": 1920,
+    "height": 1080,
+    "fps": "24",
+    "even_dimensions": true,
+    "cfr": true
+  },
+  "color": {
+    "space": "bt709",
+    "transfer": "bt709",
+    "primaries": "bt709",
+    "range": "tv"
+  },
+  "audio": {
+    "present": true,
+    "sample_rate": 48000,
+    "channels": 2,
+    "codec": "aac"
+  },
+  "max_av_start_offset_s": 0.05
+}
