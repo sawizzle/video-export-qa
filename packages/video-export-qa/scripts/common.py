@@ -23,7 +23,7 @@ import subprocess
 import sys
 from fractions import Fraction
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 

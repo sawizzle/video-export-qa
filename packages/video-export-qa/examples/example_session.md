@@ -68,12 +68,12 @@ Exit code: 1 (1 means at least one check failed).
 | --- | --- |
 | File | input.mp4 |
 | Size | 214,087 bytes |
-| Modified (UTC) | 2026-10-12T16:10:11Z |
-| SHA-256 of the file | 86b9dce87e21... |
+| Modified (UTC) | 2026-10-15T06:38:31Z |
+| SHA-256 of the file | c789b8f9e9e2... |
 | Spec | spec_barcode_run.json (sha256 d86de81a8019...) |
 | Parts run | qa_probe.py, qa_audio.py, qa_frames.py (expect 0-29,36-95) |
-| Report made (UTC) | 2026-10-12T16:10:11Z |
-| Tool | run_qa.py 1.2.0 on Python 3.14.6 |
+| Report made (UTC) | 2026-10-15T06:38:31Z |
+| Tool | run_qa.py 1.2.1 on Python 3.14.6 |
 | ffmpeg | ffmpeg version 8.1.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers |
 | ffprobe | ffprobe version 8.1.1-full_build-www.gyan.dev Copyright (c) 2007-2026 the FFmpeg developers |
 

@@ -16,6 +16,8 @@ It reads only the exported file, so the check does not depend on the editor or e
 
 Copy this whole folder (`video-export-qa`) into your agent's skills folder. For Claude Code that is `~/.claude/skills/` for every project, or `.claude/skills/` inside one project. Then ask the agent in plain words, for example "check this export against my delivery spec". `SKILL.md` is the file the agent reads.
 
+If your agent got the skill as text from a marketplace tool and nothing was installed, there is no folder to copy. `SKILL.md` then sends the agent to `references/no-skill-folder.md`, which lists the few files each task needs and a snippet that writes them to a temporary folder outside your project; the agent deletes that folder afterwards.
+
 If your agent does not pick the skill up on its own, say: use the video-export-qa skill.
 
 ## Requirements
@@ -23,7 +25,7 @@ If your agent does not pick the skill up on its own, say: use the video-export-q
 - FFmpeg: `ffmpeg` and `ffprobe` on the PATH (or pass `--ffmpeg` and `--ffprobe`). Not included, not downloaded.
 - Python 3.9 or newer, standard library only.
 
-Tested: the scripts were run from Claude Code on Windows 11. The 878-test suite for this version, which builds its own clips, passes on Windows 11 with ffmpeg and ffprobe 5.1, 7.1, 8.0.1, 8.1.1 and 9.0.1 on Python 3.14.6, and with ffmpeg and ffprobe 8.1.1 also on Python 3.9.25 and 3.13.13. It passes in stock Ubuntu 22.04, Debian 12, Ubuntu 24.04 and Ubuntu 26.04 containers too, with ffmpeg and ffprobe 4.4.2 (Python 3.10.12), 5.1.9 (3.11.2), 6.1.1 (3.12.3) and 8.0.1 (3.14.4). Together these runs cover Python 3.9 to 3.14 (3.9.25, 3.10.12, 3.11.2, 3.12.3, 3.13.13, 3.14.4 and 3.14.6). On 4.4 and 5.1 the tests that need a rotated test clip are skipped because those builds lack `-display_rotation`, so rotation handling was not exercised there. Not tested: macOS, ffmpeg older than 4.4, and agents other than Claude Code. The code uses only the Python standard library and is written to the Python 3.9 grammar.
+Tested: the scripts were run from Claude Code on Windows 11. The 923-test suite for this version, which builds its own clips, passes on Windows 11 with ffmpeg 5.1, 7.1, 8.0.1, 8.1.1 and 9.0.1 on Python 3.14.6 (each with the ffprobe of the same build, except two runs: the 5.1 run used an ffprobe built from a development snapshot of 31 August 2022, a little newer than 5.1, and the 7.1 run used the ffprobe of 8.1.1), and with ffmpeg and ffprobe 8.1.1 also on Python 3.9.25 and 3.13.13. It passes in stock Ubuntu 22.04, Debian 12, Ubuntu 24.04 and Ubuntu 26.04 containers too, with ffmpeg and ffprobe 4.4.2 (Python 3.10.12), 5.1.9 (3.11.2), 6.1.1 (3.12.3) and 8.0.1 (3.14.4). Together these runs cover Python 3.9 to 3.14 (3.9.25, 3.10.12, 3.11.2, 3.12.3, 3.13.13, 3.14.4 and 3.14.6). On 4.4 and 5.1 the tests that need a rotated test clip are skipped because those builds lack `-display_rotation`, so rotation handling was not exercised there. Not tested: macOS, ffmpeg older than 4.4, and agents other than Claude Code. The code uses only the Python standard library and is written to the Python 3.9 grammar.
 
 Source and tests: the suite and the source are in the public repository https://github.com/sawizzle/video-export-qa, not in this folder. From a checkout of that repository, run `python -I -B -m unittest discover -s tests/video-export-qa` in its root.
 
@@ -52,6 +54,7 @@ Nothing is written to disk except the files you name, and nothing is overwritten
 | `references/interpreting-results.md` | Every check id: what a FAIL or WARN means, likely causes, what to do. |
 | `references/pitfalls.md` | Measured traps: variable frame rate, GIF delay rounding, AAC start offsets, untagged colour, full-range pixel formats, silent exports, raw streams. |
 | `references/editor-recipes.md` | How to prove an edit with the barcode clip, with expected segments for common edits. |
+| `references/no-skill-folder.md` | For an agent that received the skill as text and has no skill folder: the smallest set of files for each task, a tested snippet that writes them to a temporary folder, and how to delete it. |
 | `examples/` | Three spec files (a full delivery spec, the same without the loudness keys for a barcode run, and a GIF spec), a real sample report, and a complete example session. |
 
 ## Limits

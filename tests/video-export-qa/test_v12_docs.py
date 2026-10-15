@@ -35,6 +35,9 @@ SCRIPTS = PACKAGE / "scripts"
 REFERENCES = PACKAGE / "references"
 EXAMPLES = PACKAGE / "examples"
 LISTING = ROOT / "listing" / "video-export-qa"
+# The listing proposal that is in force. listing_update_v1.2_PROPOSAL.md is the record of 1.2; its own text is still
+# pinned below, but the listing source now carries the 1.2.1 text, so the New blocks are compared with this one.
+PROPOSAL_IN_FORCE = "update_v1.2.1_PROPOSAL.md"
 TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
@@ -986,8 +989,11 @@ class ReAuditDocumentTests(unittest.TestCase):
         self.assertNotIn("exception", honest)
 
     def test_the_proposal_new_text_is_exactly_the_text_in_the_listing_source(self):
+        # The proposal in force is the newest one (PROPOSAL_IN_FORCE); the 1.2 proposal stays as the record of 1.2. Every
+        # field the proposal in force changes must carry exactly the text of the listing source, and it must change the
+        # four fields below. A field it does not list (the summary did not change in 1.2.1) is not compared.
         texts = listing_texts()
-        proposal = texts["listing_update_v1.2_PROPOSAL.md"]
+        proposal = texts[PROPOSAL_IN_FORCE]
 
         def quoted_blocks(section_title):
             body = proposal.split("## " + section_title)[1].split("\n## ")[0]
@@ -995,16 +1001,27 @@ class ReAuditDocumentTests(unittest.TestCase):
             return ["\n".join(line[2:] if line.startswith("> ") else line[1:] for line in block.rstrip("\n").split("\n")) for block in blocks]
 
         description = texts["description.md"].strip("\n")
-        self.assertEqual(quoted_blocks("1. Full Description (the whole field)"), [description])
         fields = texts["listing_fields.md"]
 
         def field(title):
             return re.search(r"^## %s\n(.*?)(?=^## |\Z)" % re.escape(title), fields, re.M | re.S).group(1).strip("\n")
 
-        self.assertEqual(quoted_blocks("3. Compatibility Note"), [field("Compatibility note")])
-        self.assertEqual(quoted_blocks("4. Extra Details > Known limitations"), [field("Known limitations")])
-        self.assertEqual(quoted_blocks("5. Permissions (tools, file scopes and notes)"), [field("Permissions")])
-        self.assertEqual(quoted_blocks("2. Summary (one line)"), [field("Summary (one line)")])
+        compared = {
+            "1. Full Description (the whole field)": description,
+            "2. Summary (one line)": field("Summary (one line)"),
+            "3. Compatibility Note": field("Compatibility note"),
+            "4. Extra Details > Known limitations": field("Known limitations"),
+            "5. Permissions (tools, file scopes and notes)": field("Permissions"),
+        }
+        listed = [title for title in compared if "\n## " + title + "\n" in proposal]
+        for title in ("1. Full Description (the whole field)", "3. Compatibility Note",
+                      "4. Extra Details > Known limitations", "5. Permissions (tools, file scopes and notes)"):
+            self.assertIn(title, listed, "the proposal in force changes this field")
+        for title in listed:
+            with self.subTest(field=title):
+                self.assertEqual(quoted_blocks(title), [compared[title]])
+        # negative control: a text that differs from the source is not equal to it
+        self.assertNotEqual(compared["3. Compatibility Note"] + " x", compared["3. Compatibility Note"])
 
     def test_the_proposal_has_a_release_checklist_that_names_the_public_repository(self):
         proposal = listing_texts()["listing_update_v1.2_PROPOSAL.md"]
@@ -1017,7 +1034,7 @@ class ReAuditDocumentTests(unittest.TestCase):
         texts = listing_texts()
         faq = re.search(r"^## FAQ\n(.*?)(?=^## |\Z)", texts["listing_fields.md"], re.M | re.S).group(1)
         answers = [block.split("\nA: ", 1)[1].strip("\n") for block in faq.strip("\n").split("\n\n") if "\nA: " in block]
-        section = texts["listing_update_v1.2_PROPOSAL.md"].split("## 6. FAQ")[1].split("\n## ")[0]
+        section = texts[PROPOSAL_IN_FORCE].split("## 6. FAQ")[1].split("\n## ")[0]
         new_blocks = re.findall(r"^New:\n((?:>.*\n?)+)", section, re.M)
         self.assertGreater(len(new_blocks), 2)
         for block in new_blocks:
