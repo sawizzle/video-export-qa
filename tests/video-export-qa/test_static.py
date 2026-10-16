@@ -226,7 +226,8 @@ def package_files():
 
 
 def test_files():
-    return [p for p in sorted(TESTS.glob("*.py"))]
+    # route2/ holds the shared extractor template and its generator (the source of references/no-skill-folder.md)
+    return [p for p in sorted(TESTS.glob("*.py"))] + sorted((TESTS / "route2").glob("*.py"))
 
 
 def scripts():

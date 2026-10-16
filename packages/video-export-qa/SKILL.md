@@ -11,10 +11,10 @@ If your agent does not pick this skill up on its own, say: use the video-export-
 
 ## If there is no skill folder
 
-If this skill reached you as text only (a saved response, or a message made of `### File: video-export-qa/<path>` blocks) and nothing was installed, `<skill-dir>` does not exist. Before you run anything:
+If this skill reached you as text and nothing was installed (there is no `video-export-qa` folder on disk), `<skill-dir>` does not exist yet. Before you run anything:
 
-1. Find the block `### File: video-export-qa/references/no-skill-folder.md` in the response (search for that line) and read it.
-2. As it shows, write only the files it lists for the user's task into a temporary folder outside the user's project, and use that folder as `<skill-dir>` in every command below. Do not write the other scripts.
+1. Fetch `video-export-qa/references/no-skill-folder.md` the same way you received this text (it is in the skill's file list) and follow it exactly.
+2. It has you make a fresh folder in the system temp folder with a short program, write into it only the files the user's task needs, and verify every file with that program before any script runs. That folder is `<skill-dir>` in every command below.
 3. Run from the folder that holds the export, and delete the temporary folder when you are done.
 
 ## When to use
@@ -43,8 +43,8 @@ Do not use it to transcode, trim, cut, repair or re-create the user's videos, to
 
 - FFmpeg with `ffmpeg` and `ffprobe` on the PATH, or pass `--ffmpeg PATH` and `--ffprobe PATH`. Nothing is installed or downloaded by the skill.
 - Python 3.9 or newer, standard library only.
-- Tested: the scripts were run from Claude Code on Windows 11. The 923-test suite for this version passes on Windows 11 with ffmpeg 5.1, 7.1, 8.0.1, 8.1.1 and 9.0.1 on Python 3.14.6, and with ffmpeg 8.1.1 also on Python 3.9.25 and 3.13.13. It passes in stock Ubuntu 22.04, Debian 12, Ubuntu 24.04 and Ubuntu 26.04 containers too, with ffmpeg 4.4.2 (Python 3.10.12), 5.1.9 (3.11.2), 6.1.1 (3.12.3) and 8.0.1 (3.14.4). Together these runs cover Python 3.9 to 3.14 (3.9.25, 3.10.12, 3.11.2, 3.12.3, 3.13.13, 3.14.4 and 3.14.6). On ffmpeg 4.4 and 5.1 the rotation tests are skipped (those builds lack `-display_rotation`). Not tested: macOS, ffmpeg older than 4.4, and agents other than Claude Code. The test suite is not part of this folder: it is kept in the project repository https://github.com/sawizzle/video-export-qa. To run it, clone that repository and run `python -I -B -m unittest discover -s tests/video-export-qa` from its root.
-- Commands below use `python`; use `python3` where that is the name. `<skill-dir>` is the folder that holds this file (with no skill folder: the temporary folder, see above). `-I -B` runs Python without user settings and without writing cache files. Run every command from the folder that holds the export, so reports land next to it.
+- Tested: the scripts were run from Claude Code on Windows 11. The 985-test suite for this version passes on Windows 11 with ffmpeg 5.1, 7.1, 8.0.1, 8.1.1 and 9.0.1 on Python 3.14.6, and with ffmpeg 8.1.1 also on Python 3.9.25 and 3.13.13. It passes in stock Ubuntu 22.04, Debian 12, Ubuntu 24.04 and Ubuntu 26.04 containers too, with ffmpeg 4.4.2 (Python 3.10.12), 5.1.9 (3.11.2), 6.1.1 (3.12.3) and 8.0.1 (3.14.4). Together these runs cover Python 3.9 to 3.14 (3.9.25, 3.10.12, 3.11.2, 3.12.3, 3.13.13, 3.14.4 and 3.14.6). On ffmpeg 4.4 and 5.1 the rotation tests are skipped (those builds lack `-display_rotation`). Not tested: macOS, ffmpeg older than 4.4, and agents other than Claude Code. The test suite is not part of this folder: it is kept in the project repository https://github.com/sawizzle/video-export-qa. To run it, clone that repository and run `python -I -B -m unittest discover -s tests/video-export-qa` from its root.
+- Commands below use `python`; use `python3` where that is the name. `<skill-dir>` is the folder that holds this file (with no skill folder: the verified temporary folder of `references/no-skill-folder.md`, which holds the scripts but not this file; write it in single quotes). `-I -B` runs Python without user settings and without writing cache files. Run every command from the folder that holds the export, so reports land next to it.
 
 ## Workflow
 

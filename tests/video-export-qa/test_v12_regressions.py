@@ -10,7 +10,7 @@
 #   D12 every unknown spec key gets its own Next steps entry; hints do not point at the wrong key;
 #       a documented key is never reported as unknown
 #   D13 the effective_duration row never shows two numbers that disagree next to a PASS
-#   D15 the version is 1.2.1 (these changes came with 1.2.0; 1.2.1 changed no script behaviour)
+#   D15 the version is 1.2.2 (these changes came with 1.2.0; 1.2.1 and 1.2.2 changed no script behaviour)
 #   Re-audit round:
 #       every raw elementary stream (H.264, HEVC, MPEG-4, MPEG-2, MJPEG, AV1) has its cfr and fps NOT MEASURED;
 #       a NOT MEASURED row gets advice that fits its cause (not "try a newer ffmpeg" for a file limit);
@@ -224,14 +224,14 @@ def rows(data, check_id):
 # --------------------------------------------------------------------------- D15 the version
 
 class VersionTests(unittest.TestCase):
-    def test_the_version_is_1_2_1(self):
-        self.assertEqual(common.VERSION, "1.2.1")
+    def test_the_version_is_1_2_2(self):
+        self.assertEqual(common.VERSION, "1.2.2")
 
     def test_a_report_records_it(self):
         _code, data = qa_json("tone.mp4")
-        self.assertEqual(data["provenance"]["version"], "1.2.1")
+        self.assertEqual(data["provenance"]["version"], "1.2.2")
         _code, md, _err = qa_markdown("tone.mp4")
-        self.assertIn("run_qa.py 1.2.1 on Python", md)
+        self.assertIn("run_qa.py 1.2.2 on Python", md)
 
 
 # --------------------------------------------------------------------------- D1, D2 nothing unmeasured is a PASS
@@ -735,7 +735,7 @@ class ReportOrderTests(unittest.TestCase):
         table_rows = [line for line in table.splitlines() if line.startswith("| ") and "`" in line]
         self.assertEqual(len(table_rows), len(data["checks"]))
         self.assertIn("SHA-256 of the file", md)
-        self.assertIn("run_qa.py 1.2.1 on Python", md)
+        self.assertIn("run_qa.py 1.2.2 on Python", md)
         self.assertIn("output 0-23 -> source 0-23", md)
 
     def test_the_note_under_the_table_makes_only_claims_that_are_true(self):

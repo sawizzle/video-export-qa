@@ -1,19 +1,29 @@
-# Tests for version 1.2.1 (documentation, tests and one version number; no script behaviour changed).
-# The release adds references/no-skill-folder.md for an agent that received the skill as TEXT and has no skill folder.
+# Tests for the no-skill-folder route: added in 1.2.1, rebuilt in 1.2.2 (documentation, tests and one version number; no
+# script behaviour changed). references/no-skill-folder.md is for an agent that received the skill as TEXT and has no
+# skill folder. In 1.2.1 it held a snippet that cut files out of one long saved answer of "### File:" blocks, and could
+# add files to an existing folder. The tool that hands out skills as text changed shape: its first answer is now an index,
+# each file is fetched on its own, and a long result is saved by the host (plain text or JSON) while a short one comes back
+# in the conversation. 1.2.2 replaces the snippet with a program that makes a fresh private folder, writes a file only
+# when its length and SHA-256 are the published ones, and checks the whole folder before any script runs.
 #   * ImportGraphTests    the file sets in the document's table are derived from the real import graph and from what
 #                         the scripts open at run time, so the table cannot drift when someone adds an import
 #   * MinimalSetTests     each documented set is copied ALONE into an empty folder and run for real (help plus a run on
 #                         a clip made here); leaving out any one file of a set makes it fail
-#   * SimulatorTests      get_skill_sim.py (the helper that makes a text file shaped like a "skill as text" answer)
-#   * SnippetTests        the snippet is taken out of the document verbatim and run against the simulated file; every
-#                         file must come out byte for byte, including a last block with no final newline and markdown
-#                         files that contain fenced code; broken snippets and bad requests must fail
-#   * DocumentPinTests    the new text in SKILL.md, README.md and the reference says what the code does
+#   * SimulatorTests      get_skill_sim.py: the first answer with its index, one result per file, the two saved forms
+#                         (P1 plain text, P2 JSON), the older block shape, and the stand-in tool fake_get_skill.py
+#   * RouteTests          the program is taken out of the document verbatim and every documented set is made through the
+#                         route: put from P1 and from P2 saved results, hand-written inline results then check, one put
+#                         from an older-shape answer, the stand-in tool end to end; the scripts then run from that folder.
+#                         Negative controls: a wrong hash, a missing file, a planted module (shown to run without check),
+#                         a foreign layout, an existing folder handed to the program, hand copies with the usual slips
+#   * DocumentPinTests    the text in SKILL.md, README.md and the reference says what the code does
+# The attacks on the program itself (folders, links, names, saved shapes, memory, shells) are in test_v122_extractor.py.
 # Every scanner and every harness has a negative control, so a pass means something.
 # Portability: ffmpeg and ffprobe are needed only by the tests that run a script on a clip; without them those tests
 # skip with the reason below. The listing source (listing/) is read only when it is part of the checkout.
 # Run:  python -I -B -m unittest discover -s tests/video-export-qa
 import ast
+import base64
 import json
 import os
 import re
@@ -27,6 +37,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
+import _route2  # noqa: E402  (the generator and the runner of the document's program, next to this file)
 import get_skill_sim  # noqa: E402  (the helper next to this file)
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,30 +47,34 @@ REFERENCES = PACKAGE / "references"
 EXAMPLES = PACKAGE / "examples"
 DOC = REFERENCES / "no-skill-folder.md"
 LISTING = ROOT / "listing" / "video-export-qa"
+PROPOSAL = "update_v1.2.2_PROPOSAL.md"
 SIM_SCRIPT = Path(__file__).resolve().parent / "get_skill_sim.py"
 
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
+SH = shutil.which("sh") or shutil.which("bash")
+PS = shutil.which("powershell") if os.name == "nt" else None
 NO_FFMPEG = "ffmpeg and ffprobe are required on PATH"
 LISTING_ABSENT = "the listing source folder (listing/) is not part of this checkout; the public repository has only packages/ and tests/"
 
-# The description line of SKILL.md was trigger-tested for 1.2.0 and must not change in 1.2.1.
+# The description line of SKILL.md was trigger-tested for 1.2.0 and must not change.
 DESCRIPTION_LINE = ("description: Measures video, GIF and audio exports with ffprobe, ffmpeg and a built-in GIF parser. "
                     "Use when asked to check a delivery spec, prove which frames an edit kept, test constant frame rate, "
                     "measure GIF duration or find silent or too-quiet audio. Do not use for editing, trimming or converting.")
 
-# Words the new text must not use to describe what a marketplace's wrapper text says: the wording changed within two
-# days once, so the package makes no claim about it and does not name the service.
+# Words the new text must not use to describe what a marketplace's own text around an answer says: that wording changed
+# within days, so the package makes no claim about it and does not name the service or its tool.
 WRAPPER_CLAIMS = (
     r"never write (any part of )?this skill",
     r"pip(e|ing) the script",
+    r"\bpip(e|ed|es|ing)\b",
     r"short-lived",
     r"(do not|don't) (save|write) (it |them )?(to|into) (a |the )?(skills? |project )",
     r"load this skill again",
+    r"in-session",
     r"get_skill",
     r"Agensi",
 )
-
 
 # What the pre-submit scan of the release tooling fails a package for: a recursive delete in any file of it.
 RECURSIVE_DELETE = re.compile(r"rm\s+-rf|Remove-Item\b[^\n]*-Recurse|rmtree\(|del\s+/[sfq]")
@@ -87,6 +102,43 @@ def documented_sets(text=None):
         rows.append((match.group("task").strip(), re.findall(r"`([\w]+\.py)`", match.group("run")),
                      re.findall(r"`([\w]+\.py)`", match.group("files")), int(match.group("size"))))
     return rows
+
+
+def kb(size):
+    """Bytes in KB of 1,000 bytes, rounded to the nearest whole KB (the unit section 1 of the document states)."""
+    return (size + 500) // 1000
+
+
+GUIDE = "references/interpreting-results.md"
+UNIT_SENTENCE = ("Size is what you would have to write, in KB of 1,000 bytes (the skill's file list counts KB of 1,024 bytes, "
+                 "so its numbers are a little smaller).")
+
+
+def size_problems(text):
+    """Every size in section 1 of the document that is not the real size of the package files, in KB of 1,000 bytes:
+    the Size column of each row, the sizes the text after the table repeats, and the guidance file."""
+    section = text.split("## 1. ")[1].split("\n## ")[0]
+    problems = []
+    rows = documented_sets(text)
+    for task, _run, files, size_kb in rows:
+        real = sum((SCRIPTS / name).stat().st_size for name in files)
+        if size_kb != kb(real):
+            problems.append("%s: %d KB stated, %d bytes = %d KB" % (task, size_kb, real, kb(real)))
+    sizes = {task: size for task, _run, _files, size in rows}
+    real_rows = {task: kb(sum((SCRIPTS / name).stat().st_size for name in files)) for task, _run, files, _size in rows}
+    audio = [t for t in real_rows if t.startswith("Loudness")]
+    for label, pattern, real in (
+            ("audio row in the text", r"one set of three files \((\d+) KB\)", real_rows[audio[0]] if audio else None),
+            ("whole report in the text", r"The whole report needs seven files \((\d+) KB\)", real_rows.get("The whole report")),
+            ("guidance file", r"`references/interpreting-results\.md` \((\d+) KB\)", kb(PACKAGE.joinpath(*GUIDE.split("/")).stat().st_size))):
+        found = re.findall(pattern, section)
+        if found != [str(real)]:
+            problems.append("%s: %s stated, %s KB real" % (label, found, real))
+    if UNIT_SENTENCE not in section:
+        problems.append("the unit sentence (KB of 1,000 bytes, the file list's KB of 1,024 bytes) is missing")
+    if len(sizes) != 7:
+        problems.append("%d rows, 7 expected" % len(sizes))
+    return problems
 
 
 def local_imports(source, modules):
@@ -149,7 +201,7 @@ def materialise(files, without=None):
 
 def run_script(folder, script, *args, cwd):
     proc = subprocess.run([sys.executable, "-I", "-B", str(Path(folder) / "scripts" / script)] + [str(a) for a in args],
-                          capture_output=True, cwd=str(cwd))
+                          capture_output=True, cwd=str(cwd), env=_route2.child_env(tempfile.gettempdir()))
     return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
 
 
@@ -164,23 +216,11 @@ def listing_of(folder):
     return sorted(str(p.relative_to(folder)).replace(os.sep, "/") for p in Path(folder).rglob("*") if p.is_file())
 
 
-def snippet_blocks(doc_text=None):
-    doc_text = read(DOC) if doc_text is None else doc_text
-    return re.findall(r"^```python\n(.*?)^```$", doc_text, re.S | re.M)
-
-
-def run_snippet(snippet, response, folder, names, cwd=None):
-    """What an agent does: the program on standard input, the response file, the folder and the names as arguments."""
-    proc = subprocess.run([sys.executable, "-I", "-B", "-", str(response), str(folder)] + list(names),
-                          input=snippet.encode("ascii"), capture_output=True, cwd=None if cwd is None else str(cwd))
-    return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
-
-
 class Scratch:
     """A scratch folder for one test class, removed afterwards."""
     def __init__(self, test_case_class, prefix):
         self.path = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
-        test_case_class.addClassCleanup(shutil.rmtree, str(self.path), True)
+        test_case_class.addClassCleanup(_route2.cleanup, self.path)
 
     def __truediv__(self, name):
         return self.path / name
@@ -238,6 +278,23 @@ class ImportGraphTests(unittest.TestCase):
                 real = sum((SCRIPTS / name).stat().st_size for name in files) / 1000.0
                 self.assertLessEqual(abs(real - size_kb), max(1.5, real * 0.05), "%s: %.1f KB real, %d KB stated" % (task, real, size_kb))
 
+    def test_every_size_in_section_1_is_the_real_size_in_kb_of_1000_bytes(self):
+        # audit 2026-10-15 (D01, D07, D10): the sizes were true but only pinned within 5 per cent
+        text = read(DOC)
+        self.assertEqual(size_problems(text), [])
+        # the unit matters: in KB of 1,024 bytes (the file list's unit) the frame-rate row would be 77, not 79
+        rows = {task: sum((SCRIPTS / name).stat().st_size for name in files) for task, _run, files, _size in documented_sets(text)}
+        probe = [size for task, size in rows.items() if task.startswith("Frame rate")][0]
+        self.assertEqual((kb(probe), (probe + 512) // 1024), (79, 77))
+        self.assertTrue(all((size + 512) // 1024 < kb(size) for size in rows.values()), "every row is smaller in KB of 1,024 bytes")
+        # negative controls: each kind of wrong number is caught
+        for old, new in (("| 79 KB |", "| 75 KB |"), ("(30 KB)", "(20 KB)"), ("| 199 KB |\n| The whole report with", "| 190 KB |\n| The whole report with"),
+                         ("three files (106 KB)", "three files (105 KB)"), ("seven files (199 KB)", "seven files (200 KB)"),
+                         ("KB of 1,000 bytes (", "KB of 1,024 bytes (")):
+            with self.subTest(change=new):
+                self.assertEqual(text.count(old), 1, old)
+                self.assertTrue(size_problems(text.replace(old, new)), new)
+
     def test_only_run_qa_opens_a_file_from_references_and_the_document_says_what_is_lost_without_it(self):
         users = {path.stem for path in SCRIPTS.glob("*.py") if constants_equal_to(read(path), "references")}
         self.assertEqual(users, {"run_qa"})
@@ -250,6 +307,8 @@ class ImportGraphTests(unittest.TestCase):
         message = "No guidance is listed for this check id"
         self.assertIn(message, doc)
         self.assertIn(message, read(SCRIPTS / "run_qa.py"), "the document quotes the message the script prints")
+        # the one file of references/ the program knows is exactly that file
+        self.assertEqual([n for n in _route2.table() if n.startswith("references/")], ["references/interpreting-results.md"])
 
 
 # --------------------------------------------------------------------------- each set, alone, for real
@@ -462,7 +521,7 @@ def make_package(folder, files, skill="---\nname: demo\ndescription: x\n---\n\n#
     return folder
 
 
-# Files that make the simulated answer hard on purpose: fences inside markdown, a markdown file that ends in a fence
+# Files that make the simulated answers hard on purpose: fences inside markdown, a markdown file that ends in a fence
 # line, one with no final newline, an empty file, Windows line ends, and a LAST block with no final newline.
 HARD_FILES = {
     "references/fenced.md": "# Notes\n\n```python\nx = 1\n```\n\nText between.\n\n```\nplain fence\n```\n\n### Not a file header\n",
@@ -472,6 +531,20 @@ HARD_FILES = {
     "scripts/crlf.py": b"a = 1\r\nb = 2\r\n",
     "scripts/zlast.py": "print(1)",
 }
+
+
+def result_paths(sim, rel):
+    base = Path(sim) / "results" / get_skill_sim.result_file_name(rel)
+    return {"inline": Path(str(base) + ".txt"), "p1": Path(str(base) + ".p1.txt"), "p2": Path(str(base) + ".p2.json")}
+
+
+def run_fake(sim, *args, extra_env=None):
+    proc = subprocess.run([sys.executable, "-I", "-B", str(Path(sim) / "fake_get_skill.py")] + list(args), capture_output=True,
+                          cwd=str(sim), env=_route2.child_env(tempfile.gettempdir(), extra_env))
+    return proc.returncode, proc.stdout.decode("utf-8"), proc.stderr.decode("utf-8", "replace")
+
+
+SAVED_MESSAGE = re.compile(r"(?:output saved to|full output saved to) (.+?)(?:\n|$)")
 
 
 class SimulatorTests(unittest.TestCase):
@@ -484,27 +557,48 @@ class SimulatorTests(unittest.TestCase):
         proc = subprocess.run([sys.executable, "-I", str(SIM_SCRIPT)] + [str(a) for a in args], capture_output=True)
         return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
 
-    def test_the_command_line_writes_the_response_for_any_package_folder(self):
+    def test_the_command_line_writes_every_shape_for_any_package_folder(self):
         for package in (PACKAGE, self.hard):
-            out = self.scratch / ("sim_%s.txt" % package.name)
+            out = self.scratch / ("sim_%s" % package.name)
             code, stdout, err = self.run_cli(package, out)
+            rels = get_skill_sim.package_files(package)
             with self.subTest(package=package.name):
                 self.assertEqual((code, err), (0, ""))
-                self.assertIn("%d file blocks" % len(get_skill_sim.package_files(package)), stdout)
-                data = out.read_bytes()
-                self.assertEqual(data, get_skill_sim.build(package).encode("utf-8"))
-                text = data.decode("utf-8")
-                headers = re.findall(r"^### File: (.*)$", text, re.M)
-                self.assertEqual(headers, ["%s/%s" % (package.name, rel) for rel in get_skill_sim.package_files(package)])
-                self.assertEqual(headers, sorted(headers), "sorted by path")
-                self.assertNotIn("### File: %s/SKILL.md" % package.name, text)
-                self.assertIn((package / "SKILL.md").read_bytes().decode("ascii").rstrip("\n"), text, "SKILL.md is inline")
-                self.assertFalse(text.endswith("\n"), "the last block has no final newline")
-                self.assertTrue(text.endswith("\n```"))
-                self.assertNotIn("\r\n", text.replace("a = 1\r\nb = 2\r\n", ""), "LF line ends outside the CRLF fixture")
+                self.assertIn("%d file results" % len(rels), stdout)
+                first = (out / "first_answer.txt").read_bytes().decode("utf-8")
+                self.assertEqual(first, get_skill_sim.first_answer(package))
+                self.assertIn((package / "SKILL.md").read_bytes().decode("ascii").rstrip("\n"), first, "SKILL.md is inline")
+                self.assertNotRegex(first, r"(?m)^#{2,3} File: ", "the first answer of the current shape holds no file")
+                index = re.findall(r"^- `([^`]+)` \((\d+\.\d) KB\)$", first, re.M)
+                self.assertEqual([p for p, _kb in index], ["%s/%s" % (package.name, rel) for rel in rels])
+                self.assertTrue(first.endswith("when SKILL.md tells you to."))
+                for rel in rels:
+                    paths = result_paths(out, rel)
+                    raw = package.joinpath(*rel.split("/")).read_bytes()
+                    result = paths["inline"].read_bytes()
+                    head = ("## File: %s/%s (from %s)\n\n" % (package.name, rel, get_skill_sim.display_name(package.name))).encode("ascii")
+                    self.assertEqual(result, head + raw, rel)
+                    self.assertEqual(paths["p1"].read_bytes(), result)
+                    doc = json.loads(paths["p2"].read_bytes().decode("ascii"))
+                    self.assertEqual(doc, [{"type": "text", "text": result.decode("utf-8")}])
+                    # the layout a real host wrote on 2026-10-15: indented by 2, no line end after the closing bracket
+                    self.assertTrue(paths["p2"].read_bytes().startswith(b'[\n  {\n    "type": "text",\n    "text": "## File: '), rel)
+                    self.assertTrue(paths["p2"].read_bytes().endswith(b'"\n  }\n]'), rel)
+                old = (out / "old_shape_answer.txt").read_bytes().decode("utf-8")
+                self.assertEqual(old, get_skill_sim.old_answer(package))
+                self.assertTrue((out / "fake_get_skill.py").is_file())
 
-    def test_every_block_is_the_file_between_two_plain_fence_lines(self):
-        text = get_skill_sim.build(PACKAGE)
+    def test_the_index_gives_sizes_in_kb_of_1024_bytes_with_one_decimal(self):
+        first = get_skill_sim.first_answer(PACKAGE)
+        sizes = dict(re.findall(r"^- `video-export-qa/([^`]+)` \((\d+\.\d) KB\)$", first, re.M))
+        for rel, kb in sizes.items():
+            self.assertEqual(kb, "%.1f" % (PACKAGE.joinpath(*rel.split("/")).stat().st_size / 1024.0), rel)
+        # the values the index of the real first answer gave for files that did not change (2026-10-15)
+        self.assertEqual((sizes["scripts/qa_probe.py"], sizes["scripts/common.py"], sizes["scripts/run_qa.py"]), ("56.9", "19.8", "27.9"))
+
+    def test_the_older_shape_is_the_file_between_two_plain_fence_lines(self):
+        text = get_skill_sim.old_answer(PACKAGE)
+        self.assertEqual(text, get_skill_sim.build(PACKAGE))
         parts = re.split(r"(?m)^### File: ", text)[1:]
         self.assertEqual(len(parts), len(get_skill_sim.package_files(PACKAGE)))
         for part in parts:
@@ -512,276 +606,486 @@ class SimulatorTests(unittest.TestCase):
             rel = head.split("/", 1)[1]
             original = (PACKAGE / Path(*rel.split("/"))).read_bytes().decode("ascii")
             self.assertEqual(body.rstrip("\n"), "\n```\n" + original + "\n```", rel)
+        self.assertFalse(text.endswith("\n"), "the last block has no final newline")
+        self.assertTrue(get_skill_sim.old_answer(self.hard).endswith("\n```"))
 
-    def test_the_real_package_gives_the_snippet_a_hard_job(self):
-        # the markdown files of the package contain fences of their own, so a parser that trusts the first closing
-        # fence cuts them short; this is why the simulated answer is built from the real package
-        text = get_skill_sim.build(PACKAGE)
-        inner = [rel for rel in get_skill_sim.package_files(PACKAGE) if rel.endswith(".md")
-                 and "\n```" in (PACKAGE / Path(*rel.split("/"))).read_bytes().decode("ascii")]
-        self.assertGreaterEqual(len(inner), 4, inner)
-        self.assertIn("### File: video-export-qa/references/no-skill-folder.md", text)
-        # negative control: the wrapper wording is neutral filler, not a copy of any service's text
-        self.assertEqual(wrapper_claims(get_skill_sim.HEADER + get_skill_sim.MIDDLE), [])
+    def test_the_stand_in_tool_prints_short_results_and_saves_long_ones_as_a_host_does(self):
+        sim = self.scratch / "sim_fake"
+        get_skill_sim.write_simulation(PACKAGE, str(sim))
+        # a short result comes back as text: the header line, a blank line, the exact file
+        code, out, err = run_fake(sim, "--file", "video-export-qa/scripts/common.py")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.encode("utf-8"), result_paths(sim, "scripts/common.py")["inline"].read_bytes())
+        self.assertEqual(run_fake(sim, "--file", "scripts/common.py")[1], out, "the path without the skill folder works too")
+        # a result over 50,000 characters is saved as JSON (P2), one over 30,000 as plain text (P1)
+        code, out, err = run_fake(sim, "--file", "video-export-qa/scripts/qa_probe.py")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(out.startswith("Output too large ("), out)
+        saved = Path(SAVED_MESSAGE.search(out).group(1))
+        self.assertEqual(saved.suffix, ".json")
+        self.assertEqual(saved.read_bytes(), result_paths(sim, "scripts/qa_probe.py")["p2"].read_bytes())
+        self.assertEqual(saved.parent, sim / "tool-results")
+        code, out, err = run_fake(sim)
+        self.assertEqual(code, 0, err)
+        self.assertIn("exceeds maximum allowed tokens", out)
+        self.assertIn("Format: Plain text", out)
+        saved = Path(SAVED_MESSAGE.search(out).group(1))
+        self.assertEqual(saved.read_bytes().decode("utf-8"), get_skill_sim.first_answer(PACKAGE))
+        # an unknown path gets two short sentences and exit 1
+        code, out, _err = run_fake(sim, "--file", "video-export-qa/scripts/nope.py")
+        self.assertEqual(code, 1)
+        self.assertIn("is not in this skill", out)
+        # negative control: with a higher limit the same long result comes back as text
+        roomy = self.scratch / "sim_roomy"
+        get_skill_sim.write_simulation(PACKAGE, str(roomy), limit=10 ** 7)
+        code, out, _err = run_fake(roomy, "--file", "video-export-qa/scripts/qa_probe.py")
+        self.assertEqual(out.encode("utf-8"), result_paths(roomy, "scripts/qa_probe.py")["inline"].read_bytes())
+        self.assertFalse((roomy / "tool-results").exists())
+
+    def test_the_wording_around_the_files_is_neutral_filler(self):
+        texts = (get_skill_sim.HEADER + get_skill_sim.MIDDLE + get_skill_sim.FIRST_HEADER + get_skill_sim.INDEX_HEADER
+                 + get_skill_sim.INDEX_END.replace("fake_get_skill.py", "the stand-in tool"))
+        self.assertEqual(wrapper_claims(texts), [])
+        self.assertIn("python fake_get_skill.py --file <path>", get_skill_sim.INDEX_END, "the end sentence names the stand-in")
+        # negative control: the scan finds the tool name
+        self.assertTrue(wrapper_claims(get_skill_sim.INDEX_END))
 
     def test_the_command_line_refuses_bad_arguments(self):
-        out = self.scratch / "never_written.txt"
+        out = self.scratch / "never_written"
         self.assertEqual(self.run_cli()[0], 2)
         self.assertEqual(self.run_cli(PACKAGE)[0], 2)
         self.assertEqual(self.run_cli(self.scratch.path, out)[0], 2, "a folder without SKILL.md")
-        code, _stdout, err = self.run_cli(self.hard, self.hard / "inside.txt")
+        self.assertEqual(self.run_cli(PACKAGE, out, "--inline-limit", "x")[0], 2)
+        code, _stdout, err = self.run_cli(self.hard, self.hard / "inside")
         self.assertEqual(code, 2)
         self.assertIn("must not be inside", err)
+        busy = self.scratch / "busy"
+        busy.mkdir()
+        (busy / "keep.txt").write_bytes(b"x")
+        code, _stdout, err = self.run_cli(PACKAGE, busy)
+        self.assertEqual(code, 2)
+        self.assertIn("not empty", err)
+        self.assertEqual(listing_of(busy), ["keep.txt"])
         self.assertFalse(out.exists())
-        self.assertFalse((self.hard / "inside.txt").exists())
-        self.assertNotIn("inside.txt", get_skill_sim.package_files(self.hard))
+        self.assertFalse((self.hard / "inside").exists())
 
 
-# --------------------------------------------------------------------------- the snippet in the document
+# --------------------------------------------------------------------------- the route, with the document's program
 
-# Breakages an agent could write (or a later edit could introduce). Each replaces one line of the snippet.
-SNIPPET_MUTATIONS = {
-    "stop at the first closing fence": (
-        'block = re.fullmatch(r"\\s*(`{3,})[^\\n]*\\n(.*)\\n\\1\\s*", body, re.S)',
-        'block = re.match(r"\\s*(`{3,})[^\\n]*\\n(.*?)\\n\\1", body, re.S)'),
-    "need a newline after the last fence": (
-        'block = re.fullmatch(r"\\s*(`{3,})[^\\n]*\\n(.*)\\n\\1\\s*", body, re.S)',
-        'block = re.fullmatch(r"\\s*(`{3,})[^\\n]*\\n(.*)\\n\\1\\n\\s*", body, re.S)'),
-    "keep the newline in front of the closing fence": (
-        'block = re.fullmatch(r"\\s*(`{3,})[^\\n]*\\n(.*)\\n\\1\\s*", body, re.S)',
-        'block = re.fullmatch(r"\\s*(`{3,})[^\\n]*\\n(.*\\n)\\1\\s*", body, re.S)'),
-    "read the response with universal newlines (a CRLF file changes)": (
-        'text = open(response, encoding="utf-8", newline="").read()',
-        'text = open(response, encoding="utf-8").read()'),
-}
-# The check that nothing is written unless every name was found. It is tested on its own, because a snippet without it
-# still extracts the files that exist.
-GUARD = ('if missing:\n    sys.exit("no complete block for: " + ", ".join(missing))\n', '')
+def doc_section(number):
+    return read(DOC).split("## %d. " % number)[1].split("\n## ")[0]
 
 
-class SnippetTests(unittest.TestCase):
+def inline_text(result_bytes):
+    """What the document says to write for a result that came back as text: everything after the header line and the
+    blank line."""
+    head, sep, rest = result_bytes.partition(b"\n\n")
+    assert sep and head.startswith(b"## File: video-export-qa/"), head[:80]
+    return rest
+
+
+class RouteTests(_route2.Scratch):
     @classmethod
     def setUpClass(cls):
-        cls.scratch = Scratch(cls, "veqa_test_snippet_")
-        cls.response = cls.scratch / "response.txt"
-        cls.response.write_bytes(get_skill_sim.build(PACKAGE).encode("utf-8"))
-        cls.hard = make_package(cls.scratch / "hardpkg", HARD_FILES)
-        cls.hard_response = cls.scratch / "hard_response.txt"
-        cls.hard_response.write_bytes(get_skill_sim.build(cls.hard).encode("utf-8"))
-        cls.snippet = snippet_blocks()[0]
+        super().setUpClass()
+        cls.sim = cls.root / "sim"
+        get_skill_sim.write_simulation(PACKAGE, str(cls.sim))
+        cls.data = cls.root / "data"
+        cls.data.mkdir()
+        if FFMPEG and FFPROBE:
+            ffmpeg("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24", "-f", "lavfi", "-i",
+                   "sine=frequency=440:sample_rate=48000", "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                   "export.mp4", cwd=cls.data)
 
-    def new_folder(self):
-        """A folder path that does not exist yet (the snippet makes it)."""
-        return self.scratch / ("out_" + uuid.uuid4().hex[:8])
+    def sets(self):
+        return [(task, run, ["scripts/" + f for f in files]) for task, run, files, _size in documented_sets()]
 
-    def extraction_problems(self, snippet):
-        """Run a snippet against both simulated answers; what is wrong with the result, or [] when it is right."""
-        problems = []
-        wanted = [
-            (self.response, PACKAGE, [name for _t, _r, files, _s in documented_sets() for name in ["scripts/" + f for f in files]]
-             + ["references/interpreting-results.md", "references/no-skill-folder.md", "references/pitfalls.md",
-                "examples/spec_barcode_run.json", "scripts/run_qa.py"]),
-            (self.hard_response, self.hard, ["references/fenced.md", "references/ends_in_fence.md", "references/no_newline.md",
-                                             "references/empty.md", "scripts/crlf.py", "scripts/zlast.py"]),
-        ]
-        for response, package, names in wanted:
-            names = sorted(set(names))
-            folder = self.new_folder()
-            code, out, err = run_snippet(snippet, response, folder, names)
-            if code != 0:
-                problems.append("%s: exit %d %s" % (package.name, code, err.strip().splitlines()[-1:] or ""))
-                continue
-            for name in names:
-                made = folder / Path(*name.split("/"))
-                original = package / Path(*name.split("/"))
-                if not made.is_file() or made.read_bytes() != original.read_bytes():
-                    problems.append("%s: %s differs from the original" % (package.name, name))
-        return problems
+    def check_ok(self, folder, names):
+        r = self.x("check", folder, *names)
+        self.assertEqual(r.code, 0, r)
+        self.assertTrue(r.out.endswith("OK %d verified files and nothing else in %s\n" % (len(names), folder)), r)
+        for name in names:
+            self.assertIn("OK %s verified (%d bytes)\n" % (name, _route2.table()[name][1]), r.out)
+        self.assertExact(folder, names)
 
-    def test_the_document_has_one_snippet_and_it_is_plain_stdlib_python(self):
-        blocks = snippet_blocks()
-        self.assertEqual(len(blocks), 1)
-        snippet = blocks[0]
-        snippet.encode("ascii")
-        self.assertLessEqual(len(snippet.splitlines()), 40, "short enough to paste under token pressure")
-        for character, why in (("'", "an apostrophe breaks a shell here-document"),
-                               ("$", "a dollar sign is expanded by some shells"), ("\t", "tabs are lost when pasting")):
-            self.assertNotIn(character, snippet, why)
-        tree = ast.parse(snippet, feature_version=(3, 9))     # the grammar of the oldest Python the skill supports
-        for path in (SIM_SCRIPT, Path(__file__).resolve()):
-            ast.parse(read(path), feature_version=(3, 9))
-        imported = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported |= {a.name.split(".")[0] for a in node.names}
-            elif isinstance(node, ast.ImportFrom):
-                imported.add(node.module.split(".")[0])
-        self.assertEqual(imported, {"re", "sys", "tempfile", "pathlib"})
-        self.assertNotIn("subprocess", imported)
-        # negative control: the scan can fail
-        self.assertEqual(len(snippet_blocks("```python\nx\n```\n\n```python\ny\n```\n")), 2)
+    def help_runs(self, folder, scripts):
+        for script in scripts:
+            code, out, err = run_script(folder, script, "--help", cwd=self.data)
+            self.assertEqual(code, 0, err)
+            self.assertIn("usage: %s" % script, out)
 
-    def test_the_snippet_gives_every_documented_set_back_byte_for_byte_and_the_hard_cases_too(self):
-        self.assertEqual(self.extraction_problems(self.snippet), [])
+    def test_every_documented_set_comes_out_through_put_from_saved_results_of_both_forms(self):
+        for form in ("p1", "p2"):
+            for task, run, names in self.sets():
+                with self.subTest(form=form, task=task):
+                    folder = self.new()
+                    for name in names:
+                        r = self.x("put", folder, result_paths(self.sim, name)[form], name)
+                        self.assertEqual((r.code, r.out), (0, "OK %s verified (%d bytes)\n" % (name, _route2.table()[name][1])), r)
+                    self.check_ok(folder, names)
+                    self.help_runs(folder, run)
 
-    def test_the_snippet_prints_what_it_wrote_and_names_the_folder(self):
-        folder = self.new_folder()
-        names = ["scripts/qa_probe.py", "scripts/common.py"]
-        code, out, err = run_snippet(self.snippet, self.response, folder, names)
-        self.assertEqual((code, err), (0, ""))
-        lines = out.splitlines()
-        self.assertEqual(len(lines), 3)
-        for line, name in zip(lines, names):
-            self.assertEqual(line, "wrote %s %d characters" % ((folder / Path(*name.split("/"))).as_posix(),
-                                                              (PACKAGE / Path(*name.split("/"))).stat().st_size))
-        self.assertEqual(lines[-1], "skill folder: " + folder.as_posix())
-        self.assertEqual(listing_of(folder), sorted(names), "nothing but what was asked for")
+    def test_every_documented_set_comes_out_from_results_written_by_hand_then_check(self):
+        # section 4: a result that came back as text is written, after its header line and the blank line, exactly as shown
+        for task, run, names in self.sets():
+            with self.subTest(task=task):
+                folder = self.new()
+                for name in names:
+                    text = inline_text(result_paths(self.sim, name)["inline"].read_bytes())
+                    folder.joinpath(*name.split("/")).write_bytes(text)
+                self.check_ok(folder, names)
+                self.help_runs(folder, run)
 
-    def test_new_makes_a_fresh_temporary_folder_outside_the_project_and_an_existing_folder_is_filled_further(self):
-        code, out, err = run_snippet(self.snippet, self.response, "new", ["scripts/common.py"])
-        self.assertEqual((code, err), (0, ""))
-        folder = Path(out.splitlines()[-1].split("skill folder: ", 1)[1])
-        self.addCleanup(shutil.rmtree, str(folder), True)
-        self.assertTrue(folder.name.startswith("veqa_"))
-        self.assertEqual(folder.resolve().parent, Path(tempfile.gettempdir()).resolve())
-        self.assertEqual(listing_of(folder), ["scripts/common.py"])
-        code, out, err = run_snippet(self.snippet, self.response, folder, ["scripts/qa_gif.py", "references/interpreting-results.md"])
-        self.assertEqual((code, err), (0, ""))
-        self.assertEqual(listing_of(folder), ["references/interpreting-results.md", "scripts/common.py", "scripts/qa_gif.py"])
-        # two runs with "new" give two folders
-        code, out2, _err = run_snippet(self.snippet, self.response, "new", ["scripts/common.py"])
-        other = Path(out2.splitlines()[-1].split("skill folder: ", 1)[1])
-        self.addCleanup(shutil.rmtree, str(other), True)
-        self.assertNotEqual(other, folder)
+    def test_the_guidance_file_goes_through_the_route_too(self):
+        name = "references/interpreting-results.md"
+        for form in ("p1", "p2", "inline"):
+            with self.subTest(form=form):
+                folder = self.new()
+                if form == "inline":
+                    folder.joinpath(*name.split("/")).write_bytes(inline_text(result_paths(self.sim, name)["inline"].read_bytes()))
+                else:
+                    self.assertEqual(self.x("put", folder, result_paths(self.sim, name)[form], "video-export-qa/" + name).code, 0)
+                self.check_ok(folder, [name])
 
-    def test_the_last_block_has_no_final_newline_and_is_still_read(self):
-        text = self.response.read_bytes()
-        self.assertFalse(text.endswith(b"\n"))
-        last = re.findall(rb"(?m)^### File: (\S+)$", text)[-1].decode("ascii").split("/", 1)[1]
-        self.assertEqual(last, "scripts/run_qa.py")
-        folder = self.new_folder()
-        code, _out, err = run_snippet(self.snippet, self.response, folder, [last])
-        self.assertEqual((code, err), (0, ""))
-        self.assertEqual((folder / "scripts" / "run_qa.py").read_bytes(), (SCRIPTS / "run_qa.py").read_bytes())
-        # the same for the synthetic package, whose last block is a one-line file with no newline
-        self.assertFalse(self.hard_response.read_bytes().endswith(b"\n"))
-        # negative control: a pattern that needs a newline after the closing fence misses exactly this block
-        needs_newline = SNIPPET_MUTATIONS["need a newline after the last fence"]
-        broken = self.snippet.replace(needs_newline[0], needs_newline[1])
-        self.assertNotEqual(broken, self.snippet)
-        code, _out, err = run_snippet(broken, self.response, self.new_folder(), [last])
-        self.assertNotEqual(code, 0)
-        self.assertIn("no complete block for: scripts/run_qa.py", err)
-
-    def test_markdown_files_with_fenced_code_come_out_whole(self):
-        for rel in ("references/pitfalls.md", "references/editor-recipes.md", "references/no-skill-folder.md"):
-            self.assertIn("\n```", read(PACKAGE / Path(*rel.split("/"))), rel + " has a fence of its own")
-        for rel in ("references/fenced.md", "references/ends_in_fence.md", "references/no_newline.md", "references/empty.md"):
-            folder = self.new_folder()
-            code, _out, err = run_snippet(self.snippet, self.hard_response, folder, [rel])
-            with self.subTest(file=rel):
-                self.assertEqual((code, err), (0, ""))
-                self.assertEqual((folder / Path(*rel.split("/"))).read_bytes(), (self.hard / Path(*rel.split("/"))).read_bytes())
-        # negative control: a pattern that stops at the first closing fence cuts a file short
-        stop_early = SNIPPET_MUTATIONS["stop at the first closing fence"]
-        broken = self.snippet.replace(stop_early[0], stop_early[1])
-        self.assertNotEqual(broken, self.snippet)
-        folder = self.new_folder()
-        run_snippet(broken, self.hard_response, folder, ["references/fenced.md"])
-        self.assertNotEqual((folder / "references" / "fenced.md").read_bytes(), (self.hard / "references" / "fenced.md").read_bytes())
-
-    def test_windows_line_ends_survive(self):
-        folder = self.new_folder()
-        code, _out, err = run_snippet(self.snippet, self.hard_response, folder, ["scripts/crlf.py"])
-        self.assertEqual((code, err), (0, ""))
-        self.assertEqual((folder / "scripts" / "crlf.py").read_bytes(), b"a = 1\r\nb = 2\r\n")
-
-    def test_a_missing_name_writes_nothing_and_fails_loudly(self):
-        folder = self.new_folder()
-        code, out, err = run_snippet(self.snippet, self.response, folder, ["scripts/common.py", "scripts/not_in_the_skill.py"])
-        self.assertNotEqual(code, 0)
-        self.assertEqual(out, "")
-        self.assertIn("no complete block for: scripts/not_in_the_skill.py", err)
-        self.assertFalse(folder.exists(), "no folder, so no half-written set")
-        # and with the check taken away the first name IS written before the failure
-        self.assertEqual(self.snippet.count(GUARD[0]), 1)
-        broken = self.snippet.replace(GUARD[0], GUARD[1])
-        self.assertNotEqual(broken, self.snippet)
-        folder = self.new_folder()
-        code, _out, _err = run_snippet(broken, self.response, folder, ["scripts/common.py", "scripts/not_in_the_skill.py"])
-        self.assertNotEqual(code, 0)
-        self.assertTrue((folder / "scripts" / "common.py").exists())
-
-    def test_a_cut_off_response_is_refused_for_the_cut_block_only(self):
-        text = self.response.read_bytes()
-        cut = self.scratch / "cut_response.txt"
-        cut.write_bytes(text[:text.rindex(b"\n```")])      # the closing fence of the last block is gone
-        folder = self.new_folder()
-        code, _out, err = run_snippet(self.snippet, cut, folder, ["scripts/run_qa.py"])
-        self.assertNotEqual(code, 0)
-        self.assertIn("no complete block for: scripts/run_qa.py", err)
-        code, _out, err = run_snippet(self.snippet, cut, folder, ["scripts/qa_probe.py"])
-        self.assertEqual((code, err), (0, ""), "the blocks before the cut are complete")
-
-    def nested_folder(self):
-        """A folder path two levels below the scratch folder, so that a file written one or two levels up stays inside it."""
-        return self.nest() / uuid.uuid4().hex[:8]
-
-    def nest(self):
-        return self.scratch / ("nest_" + self._testMethodName)
-
-    def test_names_that_are_not_files_of_the_skill_are_refused(self):
-        for bad in ("../outside.py", "scripts/../../outside.py", "/absolute.py", "scripts/", "scripts", "README.md",
-                    "tests/test_x.py", "scripts/.hidden", "scripts/a b.py", "scripts/x.py;rm"):
-            folder = self.nested_folder()
-            code, out, err = run_snippet(self.snippet, self.response, folder, ["scripts/common.py", bad])
-            with self.subTest(name=bad):
-                self.assertNotEqual(code, 0)
-                self.assertIn("not a file name of the skill", err)
-                self.assertFalse(folder.exists())
-        self.assertEqual(list(self.nest().glob("*")), [], "nothing was written, not even one level up")
-
-    def test_the_header_path_in_the_response_cannot_choose_where_a_file_goes(self):
-        hostile = self.scratch / "hostile.txt"
-        hostile.write_bytes(b"### File: skill/../../escaped.py\n\n```\nprint(1)\n```\n\n### File: skill/scripts/ok.py\n\n```\nprint(2)\n```")
-        folder = self.nested_folder()
-        code, _out, err = run_snippet(self.snippet, hostile, folder, ["scripts/ok.py"])
-        self.assertEqual((code, err), (0, ""))
-        self.assertEqual(listing_of(folder), ["scripts/ok.py"])
-        self.assertFalse((self.scratch / "escaped.py").exists(), "the header path would have led two levels up")
-        self.assertEqual([p.name for p in self.nest().glob("*")], [folder.name])
-
-    def test_broken_snippets_fail_the_extraction_check(self):
-        # negative control for extraction_problems itself: every mutation must be reported as a problem
-        self.assertEqual(self.extraction_problems(self.snippet), [])
-        for label, (old, new) in SNIPPET_MUTATIONS.items():
-            with self.subTest(mutation=label):
-                self.assertEqual(self.snippet.count(old), 1, "the mutation targets a line that is in the snippet")
-                problems = self.extraction_problems(self.snippet.replace(old, new))
-                self.assertTrue(problems, label)
+    def test_one_put_with_an_older_shape_answer_writes_a_whole_set(self):
+        saved = self.sim / "old_shape_answer.txt"
+        names = sorted(_route2.table())
+        folder = self.new()
+        r = self.x("put", folder, saved, *names)
+        self.assertEqual(r.code, 0, r)
+        self.check_ok(folder, names)
+        self.help_runs(folder, ["run_qa.py", "make_test_clip.py", "qa_compare.py"])
 
     @unittest.skipUnless(FFMPEG and FFPROBE, NO_FFMPEG)
-    def test_the_extracted_probe_runs_on_a_generated_clip(self):
-        data = self.scratch / "probe_data"
-        data.mkdir()
-        ffmpeg("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24", "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an",
-               "silent.mp4", cwd=data)
-        _task, _run, files, _size = [r for r in documented_sets() if "qa_probe.py" in r[1]][0]
-        code, out, err = run_snippet(self.snippet, self.response, "new", ["scripts/" + name for name in files])
-        self.assertEqual((code, err), (0, ""))
-        folder = Path(out.splitlines()[-1].split("skill folder: ", 1)[1])
-        self.addCleanup(shutil.rmtree, str(folder), True)
-        code, out, err = run_script(folder, "qa_probe.py", "silent.mp4", "--json", cwd=data)
-        self.assertEqual(code, 0, err)
-        video = json.loads(out)["info"]["video"]
+    def test_an_agent_with_the_stand_in_tool_answers_the_frame_rate_and_silence_question(self):
+        # the task of the fresh-buyer test: is the frame rate constant, what are the frame rate and the size, is the audio
+        # silent or too quiet. The smallest row that answers it is the audio row (it holds the probe row).
+        sim = self.root / "sim_agent"
+        get_skill_sim.write_simulation(PACKAGE, str(sim))
+        names = [["scripts/" + x for x in f] for t, _r, f, _s in documented_sets() if t.startswith("Loudness")][0]
+        folder = self.new()
+        forms = []
+        for name in names:
+            code, out, err = run_fake(sim, "--file", "video-export-qa/" + name)
+            self.assertEqual(code, 0, err)
+            if out.startswith("## File: "):                           # inline: write it with a file tool, as shown
+                folder.joinpath(*name.split("/")).write_bytes(inline_text(out.encode("utf-8")))
+                forms.append("inline")
+            else:                                                     # saved: put reads the saved file
+                saved = SAVED_MESSAGE.search(out).group(1)
+                r = self.x("put", folder, saved, name)
+                self.assertEqual(r.code, 0, r)
+                forms.append("saved")
+        self.assertEqual(sorted(forms), ["inline", "inline", "saved"], "qa_probe.py is the one result over the limit")
+        self.check_ok(folder, names)
+        got = {}
+        for script in ("qa_probe.py", "qa_audio.py"):
+            code, out, err = run_script(folder, script, "export.mp4", "--json", cwd=self.data)
+            self.assertEqual(code, 0, err)
+            got[script] = json.loads(out)
+        video = got["qa_probe.py"]["info"]["video"]
         self.assertEqual((video["counted_frames"], video["width"], video["height"], video["fps"]), (24, 320, 180, 24.0))
-        # negative control: the same set minus common.py, taken from the same response, does not run
-        lonely = self.new_folder()
-        code, _out, err = run_snippet(self.snippet, self.response, lonely, ["scripts/qa_probe.py"])
-        self.assertEqual((code, err), (0, ""))
-        code, out, err = run_script(lonely, "qa_probe.py", "silent.mp4", "--json", cwd=data)
-        self.assertNotEqual(code, 0)
-        self.assertIn("No module named 'common'", err)
+        self.assertEqual({c["id"]: c["status"] for c in got["qa_probe.py"]["checks"]}["cfr"], "PASS")
+        self.assertEqual({c["id"]: c["status"] for c in got["qa_audio.py"]["checks"]}["not_silent"], "PASS")
+        # the same numbers as the installed package gives
+        code, out, err = run_script(PACKAGE, "qa_audio.py", "export.mp4", "--json", cwd=self.data)
+        self.assertEqual(json.loads(out)["info"]["integrated_lufs"], got["qa_audio.py"]["info"]["integrated_lufs"])
+
+    @unittest.skipUnless(FFMPEG and FFPROBE, NO_FFMPEG)
+    def test_run_qa_through_the_route_finds_the_guidance_only_when_it_was_written(self):
+        names = [["scripts/" + x for x in f] for t, _r, f, _s in documented_sets() if t == "The whole report"][0]
+        spec = self.data / "spec_width.json"
+        spec.write_text(json.dumps({"video": {"width": 1920}}), encoding="utf-8")
+        reports = {}
+        for with_guide in (False, True):
+            folder = self.new()
+            wanted = names + (["references/interpreting-results.md"] if with_guide else [])
+            self.assertEqual(self.x("put", folder, self.sim / "old_shape_answer.txt", *wanted).code, 0)
+            self.check_ok(folder, wanted)
+            code, out, err = run_script(folder, "run_qa.py", "export.mp4", "--spec", spec.name, cwd=self.data)
+            self.assertEqual(code, 1, err)
+            reports[with_guide] = out
+        self.assertIn("No guidance is listed for this check id", reports[False])
+        self.assertIn("Likely causes:", reports[True])
+        self.assertNotIn("No guidance is listed", reports[True])
+
+    def test_hand_copies_with_the_usual_slips_are_refused_by_check_with_the_size_the_document_explains(self):
+        name = "scripts/common.py"
+        exact = PACKAGE.joinpath(*name.split("/")).read_bytes()
+        lines = exact.count(b"\n")
+        cases = {"the final line end is missing": (exact[:-1], -1), "one line end too many": (exact + b"\n", 1),
+                 "Windows line ends": (exact.replace(b"\n", b"\r\n"), lines), "a byte order mark": (b"\xef\xbb\xbf" + exact, 3)}
+        doc = doc_section(4)
+        for label, (data, difference) in cases.items():
+            with self.subTest(slip=label):
+                folder = self.new()
+                folder.joinpath(*name.split("/")).write_bytes(data)
+                r = self.x("check", folder, name)
+                self.assertRefused(r, "%s is not the published file (%d bytes, published %d)" % (name, len(exact) + difference, len(exact)))
+                # what put does with a saved copy that has the slip (program behaviour only: the note no longer offers put
+                # as a repair, round-3 re-audit 2026-10-16): it refuses a folder that still holds the refused file, and
+                # writes the published file once that file is gone; it leaves the saved copy as it is
+                saved = self.saved(None, raw=data)
+                self.assertRefused(self.x("put", folder, saved, name),
+                                   "%s is not the published file (%d bytes, published %d)" % (name, len(exact) + difference, len(exact)))
+                folder.joinpath(*name.split("/")).unlink()                # delete only the refused file
+                r = self.x("put", folder, saved, name)
+                self.assertEqual(r.code, 0, r)
+                self.assertExact(folder, [name])
+                self.assertEqual(self.x("check", folder, name).code, 0)
+                self.assertEqual(saved.read_bytes(), data, "put never deletes or changes the copy it read")
+        for words in ("N - M = -1, the final line end is missing", "+1, one line end too many at the end",
+                      "equal to the number of lines, Windows line ends (CR LF)", "3, a byte order mark in front",
+                      "Write that one file again with the fix and run `check` again, once. Any other difference, 0 included,",
+                      "Any other difference, 0 included, -1 while the file does end with one line end, or +1 while it does not end "
+                      "with two line ends (one extra character anywhere also gives +1), means the text differs "
+                      "in another way (an escape such as `\\n` or `\\\\` written as what it stands for is 1 shorter, `\\x1b` 3 "
+                      "shorter): write the file once more, exactly as shown, and run `check` again; if it refuses again, stop.",
+                      "Each file you wrote by hand gets that one second try, whatever the difference."):
+            self.assertIn(words, doc)
+        self.assertNotIn("the difference says why", doc, "+1 has more than one cause")
+        self.assertNotIn("repairs exactly these slips", doc, "put repairs more than these slips")
+        # the put repair route is gone (round-3 re-audit 2026-10-16): with two hand-written files that carry the same slip,
+        # check names only the first, and put after deleting that one is refused because of the other (measured below)
+        for gone in ("can repair these slips", "private working folder", "delete only the refused file", "Delete the copy"):
+            self.assertNotIn(gone, read(DOC))
+        both = self.new()
+        audio = "scripts/qa_audio.py"
+        audio_exact = PACKAGE.joinpath(*audio.split("/")).read_bytes()
+        both.joinpath(*name.split("/")).write_bytes(exact.replace(b"\n", b"\r\n"))
+        both.joinpath(*audio.split("/")).write_bytes(audio_exact.replace(b"\n", b"\r\n"))
+        self.assertRefused(self.x("check", both, name, audio), "%s is not the published file" % name)
+        both.joinpath(*name.split("/")).unlink()
+        self.assertRefused(self.x("put", both, self.saved(None, raw=exact.replace(b"\n", b"\r\n")), name),
+                           "%s is not the published file (%d bytes, published %d)" % (audio, len(audio_exact) + audio_exact.count(b"\n"), len(audio_exact)))
+        self.assertFalse(both.joinpath(*name.split("/")).exists(), "put wrote nothing")
+        # one extra character anywhere gives the same refusal as a doubled final line end (review 2026-10-16)
+        doubled = self.new()
+        doubled.joinpath(*name.split("/")).write_bytes(exact + b"\n")
+        expected = self.x("check", doubled, name)
+        for label, data in (("an X at the end", exact + b"X"), ("an X in the middle", exact[:5000] + b"X" + exact[5000:]),
+                            ("a line end in the middle", exact[:5000] + b"\n" + exact[5000:])):
+            with self.subTest(slip=label):
+                folder = self.new()
+                folder.joinpath(*name.split("/")).write_bytes(data)
+                r = self.x("check", folder, name)
+                self.assertEqual((r.code, r.out, r.err), (expected.code, expected.out, expected.err))
+                self.assertRefused(r, "%s is not the published file (%d bytes, published %d)" % (name, len(exact) + 1, len(exact)))
+        # the other differences (audit 2026-10-15: N - M = 0 was not explained; review: -1 is also what an escape slip
+        # gives). Each is measured here; check names the two sizes, put repairs none of them (they are not line-end or
+        # byte-order-mark slips), so the one second try and then stop is the rule
+        clip = "scripts/make_test_clip.py"
+        clip_exact = PACKAGE.joinpath(*clip.split("/")).read_bytes()
+        other = {"one letter changed": (name, exact[:1000] + (b"y" if exact[1000:1001] != b"y" else b"z") + exact[1001:], 0),
+                 "one character too many": (name, exact[:1000] + b"Q" + exact[1000:], 1),
+                 "\\n written as a line end": (name, exact.replace(b"\\n", b"\n", 1), -1),
+                 "\\x1b written as ESC": (name, exact.replace(b"\\x1b", b"\x1b", 1), -3),
+                 "\\\\ written as one backslash": (clip, clip_exact.replace(b"\\\\", b"\\", 1), -1)}
+        for label, (target, data, difference) in other.items():
+            published = PACKAGE.joinpath(*target.split("/")).read_bytes()
+            with self.subTest(slip=label):
+                self.assertNotEqual(data, published)
+                self.assertTrue(data.endswith(b"\n") and not data.endswith(b"\n\n"), "the file still ends with one line end")
+                folder = self.new()
+                folder.joinpath(*target.split("/")).write_bytes(data)
+                self.assertRefused(self.x("check", folder, target), "%s is not the published file (%d bytes, published %d)"
+                                   % (target, len(published) + difference, len(published)))
+                fresh = self.new()
+                self.assertRefused(self.x("put", fresh, self.saved(None, raw=data), target), "holds no exact copy of " + target)
+                self.assertExact(fresh, [])
+        # every file the program knows ends with exactly one plain line end, as the document says
+        for table_name in _route2.table():
+            data = PACKAGE.joinpath(*table_name.split("/")).read_bytes()
+            self.assertTrue(data.endswith(b"\n") and not data.endswith(b"\n\n") and b"\r" not in data, table_name)
+
+    def test_an_escape_turned_into_its_character_is_refused(self):
+        # a file tool can turn the four characters \x1b into the one character they name: never accepted
+        name = "scripts/common.py"
+        exact = PACKAGE.joinpath(*name.split("/")).read_bytes()
+        self.assertIn(b"\\x1b", exact)
+        changed = exact.replace(b"\\x1b", b"\x1b", 1)
+        folder = self.new()
+        folder.joinpath(*name.split("/")).write_bytes(changed)
+        self.assertRefused(self.x("check", folder), "is not the published file")
+        self.assertRefused(self.x("put", self.new(), self.saved(None, raw=b"## File: video-export-qa/scripts/common.py\n\n" + changed), name),
+                           "holds no exact copy of scripts/common.py")
+        # the generator flags the small files with \x, \u, \N{ escapes or a double backslash (its own warning list)
+        risky = sorted(w.split(" ")[0].split("/")[1] for w in _route2.gen_table.inline_risks(PACKAGE, _route2.table()))
+        self.assertEqual(risky, ["barcode.py", "common.py", "make_test_clip.py"])
+        # what the document says is broader and true of the real files (audit 2026-10-15: the old sentence named only three
+        # files, while run_qa.py, qa_audio.py, qa_frames.py and others hold backslash sequences too)
+        sentence = ("Eight of the nine scripts contain backslashes, in escapes such as `\\x1b`, `\\n` or `\\d` (`qa_gif.py` has none): "
+                    "write each backslash exactly as shown, never the character an escape stands for.")
+        self.assertIn(sentence, doc_section(4))
+        scripts = {path.name: path.read_bytes() for path in sorted(SCRIPTS.glob("*.py"))}
+        with_backslash = sorted(n for n, data in scripts.items() if b"\\" in data)
+        self.assertEqual((len(scripts), len(with_backslash)), (9, 8))
+        self.assertEqual(sorted(set(scripts) - set(with_backslash)), ["qa_gif.py"])
+        for escape in (b"\\x1b", b"\\n", b"\\d"):
+            self.assertTrue([n for n, data in scripts.items() if escape in data], escape)
+        self.assertNotIn(b"\\", PACKAGE.joinpath(*GUIDE.split("/")).read_bytes(), "the guidance file has none either")
+        self.assertNotIn("`common.py`, `barcode.py` and `make_test_clip.py` contain", read(DOC))
+
+    # ----------------------------------------------------------------------- negative controls
+
+    def test_a_wrong_hash_in_the_table_refuses_the_real_file(self):
+        name = "scripts/qa_gif.py"
+        digest, size = _route2.table()[name]
+        bad_digest = ("0" if digest[0] != "0" else "1") + digest[1:]
+        old_line = '"%s": ("%s" "%s", %d),' % (name, digest[:32], digest[32:], size)
+        self.assertEqual(self.src.count(old_line), 1)
+        bad = self.src.replace(old_line, '"%s": ("%s" "%s", %d),' % (name, bad_digest[:32], bad_digest[32:], size))
+        folder = self.new(src=bad)
+        self.assertRefused(self.x("put", folder, result_paths(self.sim, name)["p1"], name, src=bad), "holds no exact copy of " + name)
+        folder.joinpath(*name.split("/")).write_bytes(PACKAGE.joinpath(*name.split("/")).read_bytes())
+        self.assertRefused(self.x("check", folder, name, src=bad), "is not the published file")
+        # and the document's own program accepts that same folder
+        self.assertEqual(self.x("check", folder, name).code, 0)
+
+    def test_a_missing_file_is_refused_by_check(self):
+        folder = self.new()
+        self.assertEqual(self.x("put", folder, result_paths(self.sim, "scripts/qa_probe.py")["p2"], "scripts/qa_probe.py").code, 0)
+        self.assertRefused(self.x("check", folder, "scripts/qa_probe.py", "scripts/common.py"), "missing: scripts/common.py")
+
+    def test_a_planted_module_is_refused_by_check_and_would_have_run_without_it(self):
+        names = ["scripts/qa_probe.py", "scripts/common.py"]
+        folder = self.new()
+        self.assertEqual(self.x("put", folder, self.sim / "old_shape_answer.txt", *names).code, 0)
+        marker = self.root / ("CANARY_" + uuid.uuid4().hex[:6])
+        # common.py imports platform after the scripts folder is on sys.path, so a planted platform.py would run
+        (folder / "scripts" / "platform.py").write_text(_route2.canary_code(marker, "planted"))
+        self.assertRefused(self.x("check", folder, *names), "holds 'scripts/platform.py'")
+        self.assertRefused(self.x("put", folder, self.sim / "old_shape_answer.txt", "scripts/qa_gif.py"), "holds 'scripts/platform.py'")
+        self.assertFalse(marker.exists(), "check never imports anything from the folder")
+        # negative control: why check comes first. Run without it, the planted module runs as the user
+        run_script(folder, "qa_probe.py", "--help", cwd=self.data)
+        self.assertTrue(marker.exists(), "a planted module next to the scripts is imported by a plain run")
+
+    def test_a_foreign_layout_is_refused(self):
+        import tempfile as _tempfile
+        name = "scripts/qa_gif.py"
+        cases = []
+        # what the 1.2.1 snippet made: tempfile.mkdtemp(prefix="veqa_") with scripts/ only
+        old = Path(_tempfile.mkdtemp(prefix="veqa_", dir=str(self.tmp)))
+        (old / "scripts").mkdir()
+        cases.append(("the 1.2.1 layout (no references folder)", old, "must hold only references, scripts"))
+        f = self.new(); (f / "examples").mkdir(); cases.append(("an examples folder", f, "must hold only references, scripts"))
+        f = self.new(); (f / "SKILL.md").write_bytes(b"x"); cases.append(("a file at the top", f, "must hold only"))
+        f = self.new(); (f / "references" / "pitfalls.md").write_bytes(PACKAGE.joinpath("references", "pitfalls.md").read_bytes())
+        cases.append(("a reference the program does not know", f, "holds 'references/pitfalls.md'"))
+        f = self.new(); (f / "scripts" / "__pycache__").mkdir(); cases.append(("a bytecode folder", f, "- run scripts with -B"))
+        for label, folder, needle in cases:
+            with self.subTest(case=label):
+                self.assertRefused(self.x("check", folder), needle)
+                self.assertRefused(self.x("put", folder, result_paths(self.sim, name)["p1"], name), needle)
+                self.assertFalse(folder.joinpath(*name.split("/")).exists(), "put wrote nothing")
+
+    def test_an_existing_folder_is_never_handed_to_the_program(self):
+        # the security lesson of 2026-10-15: a snippet that accepted the path of an EXISTING folder in the shared temp
+        # folder let another user plant a module that the next script run imported. new takes no folder at all, and put
+        # and check accept only a folder of the shape new makes, owned by the user, with nothing else in it.
+        planted = self.tmp / "veqa_plantd01"
+        (planted / "scripts").mkdir(parents=True)
+        (planted / "references").mkdir()
+        marker = self.root / "CANARY_EXISTING"
+        (planted / "scripts" / "json.py").write_text(_route2.canary_code(marker, "existing"))
+        if _route2.POSIX:
+            for p in (planted, planted / "scripts", planted / "references"):
+                os.chmod(str(p), 0o700)
+        before = _route2.snapshot(self.root)
+        for args in (["new", planted], ["new", "new"], [result_paths(self.sim, "scripts/qa_gif.py")["p1"], planted, "scripts/qa_gif.py"],
+                     [result_paths(self.sim, "scripts/qa_gif.py")["p1"], "new", "scripts/qa_gif.py"]):
+            r = self.x(*args)
+            with self.subTest(args=[str(a)[-20:] for a in args]):
+                self.assertEqual((r.code, r.out), (2, ""), r)
+                self.assertTrue(r.err.startswith("usage: python -I -B - new | put FOLDER SAVED NAME... | check FOLDER [NAME...]"), r)
+        self.assertRefused(self.x("check", planted), "holds 'scripts/json.py'")
+        self.assertRefused(self.x("put", planted, result_paths(self.sim, "scripts/qa_gif.py")["p1"], "scripts/qa_gif.py"), "holds 'scripts/json.py'")
+        self.assertEqual(_route2.snapshot(self.root), before, "nothing was written anywhere")
+        self.assertFalse(marker.exists())
+        # the old snippet is gone from the document
+        doc = read(DOC)
+        self.assertNotIn("tempfile.mkdtemp(prefix=\"veqa_\")", doc)
+        self.assertNotIn("re.split(r\"(?m)^### File: \", text)", doc)
+        self.assertNotIn("the path it printed to add files to that folder", doc)
+
+    # ----------------------------------------------------------------------- the commands of section 3, as written
+
+    def command_blocks(self):
+        return re.findall(r"^```text\n(.*?)^```$", doc_section(3), re.S | re.M)
+
+    def fill(self, block, program, folder=None, saved=None, exe=None, name=None):
+        """A command block of section 3 with its placeholders filled in: only the first line (the command) changes,
+        and the placeholder line becomes the program, character for character."""
+        first, rest = block.split("\n", 1)
+        if folder is not None:
+            first = first.replace("'<FOLDER>'", "'%s'" % str(folder).replace("'", "'\\''"))
+        if saved is not None:
+            first = first.replace("'<SAVED FILE>'", "'%s'" % str(saved).replace("'", "'\\''"))
+        if name is not None:
+            first = first.replace("scripts/qa_probe.py", name)
+        first = first.replace("python -I -B -", exe + " -I -B -")
+        rest = re.sub(r"^<the program[^>\n]*>$", lambda m: program.rstrip("\n"), rest, flags=re.M)
+        return first + "\n" + rest
+
+    @unittest.skipUnless(SH, "no sh on this machine")
+    def test_the_bash_commands_of_section_3_work_as_written(self):
+        blocks = self.command_blocks()
+        bash = [b for b in blocks if "<<'EOF'" in b]
+        self.assertEqual([b.split(" ")[4] for b in bash], ["new", "put", "check"])
+        exe = '"%s"' % Path(sys.executable).as_posix()
+
+        def sh(text):
+            proc = subprocess.run([SH, "-c", text], capture_output=True, cwd=str(self.work), env=_route2.child_env(self.tmp), timeout=300)
+            return proc.returncode, proc.stdout.decode("utf-8", "replace").replace("\r\n", "\n"), proc.stderr.decode("utf-8", "replace")
+
+        code, out, err = sh(self.fill(bash[0], self.src, exe=exe))
+        self.assertEqual((code, err), (0, ""), out)
+        folder = _route2.Result(code, out, err).folder()
+        self.assertIsNotNone(folder, out)
+        names = ["scripts/qa_probe.py", "scripts/common.py", "scripts/qa_audio.py"]
+        for name in names:
+            # the folder exactly as new printed it (backslashes on Windows), in single quotes
+            code, out, err = sh(self.fill(bash[1], self.src, folder, result_paths(self.sim, name)["p2"], exe=exe, name=name))
+            self.assertEqual((code, err), (0, ""), out)
+        code, out, err = sh(self.fill(bash[2], self.src, folder, exe=exe))
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("OK 3 verified files and nothing else in", out)
+        self.assertExact(folder, names)
+
+    @unittest.skipUnless(PS, "Windows PowerShell is not on this machine")
+    def test_the_powershell_command_of_section_3_works_as_written(self):
+        blocks = [b for b in self.command_blocks() if b.startswith("@'")]
+        self.assertEqual(len(blocks), 1)
+        folder = self.new()
+        names = ["scripts/qa_probe.py", "scripts/common.py", "scripts/qa_audio.py"]
+        self.assertEqual(self.x("put", folder, self.sim / "old_shape_answer.txt", *names).code, 0)
+        script = blocks[0].replace("<the program, every line exactly as in section 2>", self.src.rstrip("\n"))
+        script = script.replace("'<FOLDER>'", "'%s'" % str(folder).replace("'", "''")).replace("| python ", '| & "%s" ' % sys.executable)
+        check = script
+
+        def powershell(text):
+            argv = [PS, "-NoProfile", "-NonInteractive", "-EncodedCommand", base64.b64encode(text.encode("utf-16-le")).decode("ascii")]
+            proc = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, timeout=300, env=_route2.child_env(self.tmp))
+            return proc.returncode, proc.stdout.decode("utf-8", "replace").replace("\r\n", "\n"), proc.stderr.decode("utf-8", "replace")
+
+        code, out, err = powershell(check + "\nexit $LASTEXITCODE\n")
+        self.assertEqual(code, 0, err)
+        self.assertIn("OK 3 verified files and nothing else in", out)
+
+    def test_the_listing_command_of_section_6_shows_the_folder_until_it_is_deleted(self):
+        command = re.search(r'^python -I -c "(.*)"$', doc_section(6), re.M).group(1)
+        folder = self.new()
+
+        def listed():
+            proc = subprocess.run([sys.executable, "-I", "-c", command], capture_output=True, env=_route2.child_env(self.tmp))
+            return ast.literal_eval(proc.stdout.decode("ascii").strip())
+
+        self.assertEqual(listed(), [folder.name])
+        _route2.cleanup(folder)
+        self.assertEqual(listed(), [])
+        self.assertIn("starts with `veqa_`", doc_section(6))
+        self.assertIn('PREFIX, TABLE = "video-export-qa", "veqa_"', self.src)
 
 
 # --------------------------------------------------------------------------- the words in the package
@@ -794,31 +1098,37 @@ class DocumentPinTests(unittest.TestCase):
     def skill(self):
         return read(PACKAGE / "SKILL.md")
 
-    def test_the_version_is_1_2_1_everywhere_the_package_states_it(self):
+    def test_the_version_is_1_2_2_everywhere_the_package_states_it(self):
         sys.path.insert(0, str(SCRIPTS))
         try:
             import common
         finally:
             sys.path.remove(str(SCRIPTS))
-        self.assertEqual(common.VERSION, "1.2.1")
+        self.assertEqual(common.VERSION, "1.2.2")
         for name in ("sample_report.md", "example_session.md"):
-            self.assertIn("run_qa.py 1.2.1 on Python", read(EXAMPLES / name))
+            self.assertIn("run_qa.py 1.2.2 on Python", read(EXAMPLES / name))
         for name, text in package_texts().items():
             with self.subTest(file=name):
-                self.assertIsNone(re.search(r"(?<![\d.])1\.2\.0(?!\d)", text), "the previous version is not named in the package")
+                self.assertIsNone(re.search(r"(?<![\d.])1\.2\.[01](?!\d)", text), "no earlier version is named in the package")
 
-    def test_the_reference_is_short_and_has_its_sections_in_order(self):
+    def test_the_reference_has_its_sections_in_order_and_one_program(self):
         text = read(DOC)
-        self.assertLessEqual(len(text.splitlines()), 80)
-        self.assertLessEqual(len(text), 8000)
+        self.assertLessEqual(len(text.splitlines()), 240)
+        self.assertLessEqual(len(text), 21500, "19,000 until the doc round of 2026-10-16 (20,613 after it), 21,000 until the "
+                                               "round after the second last read (21,087 after it)")
         headings = re.findall(r"^## (.*)$", text, re.M)
-        self.assertEqual(headings, ["1. The files each task needs", "2. Write the files", "3. Run", "4. Delete",
-                                    "5. The response came back inline"])
+        self.assertEqual(headings, ["1. The files each task needs", "2. The program", "3. Commands",
+                                    "4. Fetch, write and check the files", "5. Run", "6. Delete", "7. If anything is not as described"])
         self.assertTrue(text.startswith("# No skill folder"))
         self.assertIn("If the folder exists, ignore this file", text)
-        self.assertIn("outside the user's project", text)
+        self.assertIn("Put nothing of the skill into the user's project, and delete the folder at the end (section 6).", text)
+        self.assertNotIn("the folder is deleted at the end", text, "the note says what to do, not what an agent does")
+        self.assertEqual(_route2.doc_program(text), _route2.program())
+        # negative control: the block finder sees two blocks where there are two
+        with self.assertRaises(ValueError):
+            _route2.doc_program("```python\nx\n```\n\n```python\ny\n```\n")
 
-    def test_the_table_covers_every_common_task(self):
+    def test_the_table_covers_every_common_task_and_names_the_cheapest_route(self):
         tasks = {task: (run, files) for task, run, files, _size in documented_sets()}
         wanted = {
             "qa_probe.py": ("frame rate", "constant frame rate", "colour tags", "frame count"),
@@ -836,27 +1146,46 @@ class DocumentPinTests(unittest.TestCase):
         self.assertTrue([task for task in whole if "--barcode-expect" in task])
         both = [run for run, _files in tasks.values() if "make_test_clip.py" in run]
         self.assertEqual(both, [["make_test_clip.py", "qa_frames.py"]])
+        # the cheapest route: the audio row holds the probe row, and the whole report is seven files
+        probe = set([files for task, (run, files) in tasks.items() if run == ["qa_probe.py"]][0])
+        audio = set([files for task, (run, files) in tasks.items() if run == ["qa_audio.py"]][0])
+        self.assertLess(probe, audio)
+        self.assertEqual(len(tasks["The whole report"][1]), 7)
+        section = doc_section(1)
+        self.assertIn("The audio row holds the probe row, so one set of three files (106 KB)", section)
+        self.assertIn("The whole report needs seven files (199 KB)", section)
+        self.assertIn("single scripts first", section)
+        self.assertNotRegex(read(DOC), r"(?i)\b(are|is) (always )?(saved|inline)\b", "no claim about which result a host saves")
         # negative control: the parser finds no row in a document without the table
         self.assertEqual(documented_sets("## 1. x\n\nno table here\n"), [])
 
-    def test_every_command_in_the_reference_uses_the_skill_folder_form(self):
+    def test_every_command_in_the_reference_uses_the_skill_folder_form_and_quoted_paths(self):
         text = read(DOC)
-        commands = re.findall(r"python3? -I -B (\S+)", text)
-        self.assertGreaterEqual(len(commands), 2)
-        for path in commands:
-            if "scripts/" in path:
-                self.assertTrue(path.startswith("<skill-dir>/scripts/"), path)
-        self.assertIn("python -I -B <skill-dir>/scripts/qa_probe.py export.mp4 --spec spec.json", text)
-        self.assertIn("python -I -B - RESPONSE new scripts/qa_probe.py scripts/common.py", text)
-        self.assertIn("that folder is `<skill-dir>` for the rest of the task", text)
+        runs = re.findall(r"^python -I -B '(<skill-dir>/scripts/\w+\.py)' ", text, re.M)
+        self.assertEqual(runs, ["<skill-dir>/scripts/qa_probe.py", "<skill-dir>/scripts/qa_audio.py"])
+        commands = re.findall(r"^python -I -B - (new|put|check)(.*)$", text, re.M)
+        self.assertEqual([c[0] for c in commands], ["new", "put", "check"])
+        for _mode, rest in commands:
+            for path in re.findall(r"<[A-Z ]+>", rest):
+                self.assertIn("'%s'" % path, rest, "every path is in single quotes")
+            self.assertTrue(rest.endswith("<<'EOF'"), rest)
+        self.assertIn("'@ | python -I -B - check '<FOLDER>'", text)
+        self.assertIn("Write every path in single quotes", text)
 
-    def test_the_delete_step_matches_the_prefix_the_snippet_uses(self):
-        text = read(DOC)
-        delete = text.split("## 4. Delete")[1].split("\n## ")[0]
+    def test_the_delete_step_matches_the_prefix_the_program_uses(self):
+        delete = read(DOC).split("## 6. Delete")[1].split("\n## ")[0]
         self.assertIn("starts with `veqa_`", delete)
-        self.assertIn('tempfile.mkdtemp(prefix="veqa_")', snippet_blocks()[0])
         self.assertIn("delete nothing else", delete)
-        self.assertIn("compare the path with the `skill folder:` line", delete)
+        self.assertIn("compare the path with the `OK folder:` line", delete)
+        self.assertIn("Do not test the path you typed", delete)
+        self.assertIn("with the path in single quotes", delete)
+        # only the folder new made is deleted: the repair copies went with the repair route (round-3 re-audit 2026-10-16)
+        self.assertIn("with the path in single quotes, and delete nothing else; compare the path with the `OK folder:` line before "
+                      "you run it. A delete command can exit 0 on a path it could not find, so then list the temp folder and "
+                      "confirm that the folder's name is gone:", delete)
+        for gone in ("copies for `put`", "working folder", "that one file"):
+            self.assertNotIn(gone, delete)
+        self.assertNotIn("make no folder for this", doc_section(4))
         # The pre-submit scan fails a package that carries a recursive-delete command, so the document says in words
         # what to do and names no command. No file of the package may carry one.
         for name, content in package_texts().items():
@@ -867,12 +1196,58 @@ class DocumentPinTests(unittest.TestCase):
             self.assertTrue(RECURSIVE_DELETE.findall(sample), sample)
         self.assertEqual(RECURSIVE_DELETE.findall("delete the folder with your shell's own command"), [])
 
-    def test_the_inline_case_is_covered_and_points_at_the_smallest_row(self):
-        inline = read(DOC).split("## 5. The response came back inline")[1]
-        self.assertIn("nothing was saved to a file", inline)
-        self.assertIn("smallest row", inline)
-        self.assertIn("write nothing that is not in the row", inline)
-        self.assertIn("tempfile.mkdtemp", inline)
+    def test_the_windows_rule_for_a_temp_folder_outside_the_user_folder_is_stated(self):
+        # audit 2026-10-15 (D17): on Windows the program checks no owner and no permission (those checks are POSIX only);
+        # it relies on a per-user TEMP and on the owner-only permissions Python gives the folders it makes. Against a temp
+        # folder outside the user folder (a shared folder, a network share) this sentence is the only rule the agent has
+        section = doc_section(7)
+        for needle in ("On Windows the folder must lie inside your own user folder (normally `...\\AppData\\Local\\Temp\\`).",
+                       "If `new` prints a folder anywhere else, such as `C:\\Temp` or a network share, other users may be able to "
+                       "change it after `check`: delete it, stop and tell the user.",
+                       "On Linux the program itself checks the owner and the permissions of the folder and of the temp folder."):
+            self.assertIn(needle, section)
+        self.assertLess(section.index("On Windows the folder must lie"), section.index("Known issue:"))
+        program = _route2.program()
+        owner_lines = [line for line in program.split("\n") if re.search(r"st_uid|0o022|0o077|st_nlink", line)]
+        self.assertEqual(len(owner_lines), 3, owner_lines)
+        self.assertTrue(all("if POSIX and" in line for line in owner_lines), "every owner and mode check is POSIX only")
+        for word in ("expanduser", "USERPROFILE", "GetSecurityInfo", "win32"):
+            self.assertNotIn(word, program, "the program has no Windows owner check, so the sentence must stay")
+
+    def test_the_inline_and_the_saved_case_are_both_covered(self):
+        fetch = doc_section(4)
+        self.assertIn("If the answer was saved to a file and you were given its path, run `put`", fetch)
+        self.assertIn("write the text after the header line and the blank line, exactly as shown, with your file tool", fetch)
+        self.assertIn("never a shell here-document", fetch)
+        self.assertIn("Never run a script before `check` prints `OK <N> verified files and nothing else in <FOLDER>`", fetch)
+        # check and a script run as separate commands, never joined (second last read 2026-10-16, W3: the join advice of the
+        # round before was unsafe and is gone)
+        self.assertIn("Run `check` as a command of its own, read its `OK` lines, and only then run the script, as a separate "
+                      "command. Do not join the two with `;` or `&&`: a copy of the program that was cut short, or that arrived "
+                      "empty, can exit 0 without printing any `OK` line.", fetch)
+        for gone in ("if ($?)", "with `&&` and the script command", "If you join them in one command anyway"):
+            self.assertNotIn(gone, read(DOC))
+        # an empty program exits 0 and prints no OK line (measured on Python 3.9.25, 3.10.21 and 3.14.6 with an empty
+        # pipe); a copy cut to end in "sys" does the same on a system refusal (test_v122_extractor.py)
+        with tempfile.TemporaryDirectory(prefix="veqa_route2_test_") as tmp:
+            r = _route2.run("", "check", os.path.join(tmp, "veqa_abcdefgh"), "scripts/common.py", tmp=tmp, cwd=tmp)
+        self.assertEqual((r.code, r.out), (0, ""), r)
+        self.assertNotIn("OK", r.err)
+        self.assertIn("## File: video-export-qa/<path> (from ...)", fetch)
+        # the header the document describes is the one the program looks for
+        self.assertRegex("## File: video-export-qa/scripts/qa_probe.py (from Video Export QA)", r"^#{2,3} File: ")
+        self.assertIn(r'r"^#{2,3} File: " + re.escape(SKILL + "/" + n)', _route2.program())
+
+    def test_the_older_block_shape_is_mentioned_once_and_nothing_depends_on_it(self):
+        doc, skill = read(DOC), self.skill()
+        self.assertEqual(doc.count("### File: "), 1)
+        self.assertIn("An older shape of the skill text carried every file as a `### File: video-export-qa/<path>` block", doc)
+        section = skill.split("## If there is no skill folder\n")[1].split("\n## ")[0]
+        for text in (section, read(PACKAGE / "README.md")):
+            self.assertNotIn("### File:", text)
+            self.assertNotIn("search for", text)
+        for name in ("SKILL.md", "README.md", "references/no-skill-folder.md"):
+            self.assertNotRegex(package_texts()[name], r"(?i)\bsnippet\b|saved response", name)
 
     def test_skill_md_has_a_short_section_before_anything_runs(self):
         skill = self.skill()
@@ -882,34 +1257,46 @@ class DocumentPinTests(unittest.TestCase):
         section = skill.split("## If there is no skill folder\n")[1].split("\n## ")[0]
         lines = [line for line in section.strip("\n").split("\n") if line.strip()]
         self.assertGreaterEqual(len(lines), 4)
-        self.assertLessEqual(len(lines), 8, "6 to 10 lines with the heading")
-        for needle in ("references/no-skill-folder.md", "temporary folder", "outside the user's project", "<skill-dir>",
-                       "write only the files it lists", "delete the temporary folder"):
+        self.assertLessEqual(len(lines), 9, "6 to 10 lines with the heading")
+        for needle in ("video-export-qa/references/no-skill-folder.md", "the same way you received this text", "system temp folder",
+                       "<skill-dir>", "only the files the user's task needs", "verify every file", "delete the temporary folder"):
             self.assertIn(needle, section)
         self.assertLess(skill.index("## If there is no skill folder"), skill.index("## When to use"))
         self.assertLess(skill.index("## If there is no skill folder"), skill.index("## Workflow"))
         self.assertGreater(skill.index("## If there is no skill folder"), skill.index("use the video-export-qa skill"))
         self.assertLessEqual(len(skill), 33000, "SKILL.md is not much longer than 1.2.0 (31,660 characters)")
-        self.assertIn("(with no skill folder: the temporary folder, see above)", skill)
+        self.assertIn("(with no skill folder: the verified temporary folder of `references/no-skill-folder.md`, which holds the scripts "
+                      "but not this file; write it in single quotes)", skill)
 
     def test_readme_gives_the_folder_less_route_in_the_install_section(self):
         readme = read(PACKAGE / "README.md")
         install = readme.split("## Install")[1].split("## Requirements")[0]
         self.assertIn("references/no-skill-folder.md", install)
         self.assertIn("nothing was installed", install)
-        self.assertIn("temporary folder outside your project", install)
+        self.assertIn("a fresh folder in the system temp folder, outside your project", install)
+        self.assertIn("published SHA-256 before any script runs", install)
         self.assertLessEqual(len([line for line in install.strip().split("\n") if line.strip()]), 6)
         table = readme.split("## What is in the folder")[1].split("## Limits")[0]
         self.assertIn("| `references/no-skill-folder.md` |", table)
+        self.assertIn("checks every file in it by SHA-256", table)
+        # what goes to disk, said as what the note tells the agent (review 2026-10-16, V1 and V2), and what it tells the agent
+        # to delete: the folder new made, named so that it cannot be read as the system temp folder (round-3 re-audit, Y1, Y2)
+        self.assertIn("`references/no-skill-folder.md` tells your agent (not the scripts) to write the few skill files a task needs "
+                      "into a fresh folder in the system temp folder, and to delete that folder afterwards.", readme)
+        for gone in ("delete that folder and that copy", "delete the temp folder", "working folder", "repairs a hand copy"):
+            self.assertNotIn(gone, readme)
+        self.assertIn("The note tells the agent to delete that folder afterwards.", install)
+        for promise in ("The agent deletes", "and deletes that folder afterwards", "is the file the agent reads", "the agent follows"):
+            self.assertNotIn(promise, readme)
 
-    def test_no_package_line_starts_like_a_block_separator(self):
-        # the snippet splits a response on lines that start with the separator, so a package file must not contain one
-        separator = re.compile(r"^### File: ", re.M)
+    def test_no_package_line_starts_like_a_file_header(self):
+        # a line that starts like a header of a saved answer is a lookalike the program has to step over; keep none
+        separator = re.compile(r"^#{2,3} File: ", re.M)
         for name, text in package_texts().items():
             with self.subTest(file=name):
                 self.assertIsNone(separator.search(text))
-        self.assertIsNotNone(separator.search("text\n### File: video-export-qa/x.py\n"))
-        self.assertIsNone(separator.search("the line `### File: x` is quoted in the middle of a line"))
+        self.assertIsNotNone(separator.search("text\n## File: video-export-qa/x.py\n"))
+        self.assertIsNone(separator.search("the line `## File: x` is quoted in the middle of a line"))
 
     def test_the_new_text_makes_no_claim_about_a_marketplace_wrapper_text(self):
         section = self.skill().split("## If there is no skill folder\n")[1].split("\n## ")[0]
@@ -923,13 +1310,16 @@ class DocumentPinTests(unittest.TestCase):
         self.assertTrue(wrapper_claims("run it by piping the script straight into the interpreter"))
         self.assertTrue(wrapper_claims("or a short-lived temp file removed afterwards"))
         self.assertTrue(wrapper_claims("don't save them into project or skill folders"))
+        self.assertTrue(wrapper_claims("Run scripts in-session"))
         self.assertTrue(wrapper_claims("call get_skill"))
         self.assertEqual(wrapper_claims("write the files into a temporary folder and delete it afterwards"), [])
 
-    def test_the_tests_readme_documents_the_new_module_and_the_simulator(self):
+    def test_the_tests_readme_documents_the_modules_and_the_simulator(self):
         text = read(Path(__file__).resolve().parent / "README.md")
         self.assertIn("`test_v121_no_skill_folder.py`", text)
-        self.assertIn("python -I tests/video-export-qa/get_skill_sim.py packages/video-export-qa out.txt", text)
+        self.assertIn("`test_v122_extractor.py`", text)
+        self.assertIn("python -I tests/video-export-qa/get_skill_sim.py packages/video-export-qa sim_out", text)
+        self.assertIn("python fake_get_skill.py --file video-export-qa/scripts/qa_probe.py", text)
         self.assertIn("ffmpeg and ffprobe are required on PATH", text)
         self.assertIn("no script behaviour changed", text)
 
@@ -937,29 +1327,66 @@ class DocumentPinTests(unittest.TestCase):
         # last statement of the test: a skip ends the test under failfast
         if not LISTING.is_dir():
             self.skipTest(LISTING_ABSENT)
-        proposal = (LISTING / "update_v1.2.1_PROPOSAL.md").read_bytes().decode("utf-8")
-        # the fresh-buyer re-test is done: its result stands in its own section and the placeholder is gone
-        self.assertNotIn("[[RETEST RESULT", proposal)
-        retest = proposal.split("## Fresh-buyer re-test")[1].split("\n## ")[0]
-        for word in ("Claude Sonnet", "Claude Haiku", "simulated answer", "failed commands"):
-            self.assertIn(word, retest)
+        proposal = (LISTING / PROPOSAL).read_bytes().decode("utf-8")
         self.assertIn("no script behaviour changed", proposal)
-        for heading in ("## 1. Full Description (the whole field)", "## 3. Compatibility Note", "## 6. FAQ",
-                        "## 7. Changelog for the Update dialog", "## Fresh-buyer re-test"):
+        for heading in ("## 1. Full Description (the whole field)", "## 3. Compatibility Note", "## 4. Extra Details > Known limitations",
+                        "## 5. Permissions (tools, file scopes and notes)", "## 6. FAQ", "## 7. Changelog for the Update dialog",
+                        "## Fresh-buyer re-test", "## Not claimed"):
             self.assertIn("\n" + heading, proposal)
-        # the placeholder sits in its own section, never inside a New block that would be pasted into the listing
+        # the doc round after the re-test is recorded with its commit and the fact that the buyers were not re-run, and the
+        # precheck WARNs carry their written reason (review 2026-10-16, V9)
+        retest_section = proposal.split("## Fresh-buyer re-test")[1].split("\n## ")[0]
+        for needle in ("After the re-test, an independent last read of the zip", "the commit that follows c722a04 on branch veqa-1.2.2",
+                       "The two buyers were NOT re-run on it."):
+            self.assertIn(needle, retest_section)
+        tested = proposal.split("## What was tested for this text")[1].split("\n## ")[0]
+        for needle in ("0 FAIL and 2 WARN", "process spawn x6 in `scripts/barcode.py` and x3 in `scripts/common.py`",
+                       "Every such call takes an argument list and never goes through a shell",
+                       "the exception class `subprocess.SubprocessError` named in an except clause (line 246)"):
+            self.assertIn(needle, tested)
+        # the round after the second last read is recorded too, and the join advice is marked as removed (W3)
+        for needle in ("the commit that follows 5125adb on branch veqa-1.2.2", "The two buyers were NOT re-run on that round either.",
+                       "the next round removed that joining again"):
+            self.assertIn(needle, retest_section)
+        self.assertNotIn("assertions only", proposal)
+        self.assertNotIn("or joined so that", proposal)
+        # the file scopes name the spec JSON that SKILL.md step 3 has the agent write next to the export (W5c), and say that
+        # only the veqa_* folder is to be deleted; no repair copy is left anywhere in the listing (round-3 re-audit, Y1 to Y3)
+        fields = (LISTING / "listing_fields.md").read_bytes().decode("utf-8")
+        self.assertIn("the spec *.json that SKILL.md tells your agent to write next to the export", fields)
+        self.assertIn("a veqa_* folder in the system temp folder; references/no-skill-folder.md tells it to delete only that veqa_* "
+                      "folder afterwards.", fields)
+        new_blocks = "\n".join(re.findall(r"^New:\n((?:>.*\n?)+)", proposal, re.M))
+        changelog_text = proposal.split("## 7. Changelog for the Update dialog")[1].split("```")[1]
+        for text in (fields, new_blocks, changelog_text):
+            for gone in ("repair", "working folder", "all of which"):
+                self.assertNotIn(gone, text)
+        for needle in ("the commit that follows b6ee4a3 on branch veqa-1.2.2", "the next round removed that route again"):
+            self.assertIn(needle, retest_section)
+        self.assertIn("Write the spec as a JSON file next to the export", read(PACKAGE / "SKILL.md"))
+        self.assertIn("ffmpeg and ffprobe are started with argument lists, never through a shell", read(PACKAGE / "SKILL.md"))
+        self.assertNotRegex("\n".join(re.findall(r"^New:\n((?:>.*\n?)+)", proposal, re.M)), r"\[\[|<[A-Za-z ]+>|\bTODO\b",
+                            "no placeholder in a New block")
+        changelog = proposal.split("## 7. Changelog for the Update dialog")[1].split("```")[1]
+        self.assertTrue(changelog.strip("\n").startswith("Package docs release 1.2.2 (Agensi numbers this update v1.4)"), changelog[:120])
+        # the re-test result is either still a placeholder in its own section, or filled in there: never inside a New block
         new_text = "\n".join(re.findall(r"^New:\n((?:>.*\n?)+)", proposal, re.M))
-        self.assertNotIn("RETEST RESULT", new_text)
+        self.assertNotIn("RETEST", new_text)
+        retest = proposal.split("## Fresh-buyer re-test")[1].split("\n## ")[0]
+        if "[[RETEST RESULT" not in retest:
+            self.assertGreater(len(retest.strip()), 200, "the re-test section holds the result once the placeholder is gone")
         fields = (LISTING / "listing_fields.md").read_bytes().decode("utf-8")
         description = (LISTING / "description.md").read_bytes().decode("utf-8")
         for text in (fields, description):
             self.assertIn("references/no-skill-folder.md", text)
+            self.assertNotRegex(text, r"(?i)\bsnippet\b", "the old route is not described any more")
         self.assertEqual(wrapper_claims(fields.split("## Compatibility note")[1].split("\n## ")[0]), [])
         # the sizes the listing quotes are the sizes of the document's table
         sizes = {task: size for task, _run, _files, size in documented_sets()}
         limitation = [line for line in fields.splitlines() if line.startswith("- If your agent receives the skill as text")][0]
         self.assertIn("about %d KB for a frame-rate or colour-tag check" % [s for t, s in sizes.items() if t.startswith("Frame rate")][0], limitation)
-        self.assertIn("about %d KB for the whole report" % sizes["The whole report"], limitation)
+        self.assertIn("%d KB with the audio checks" % [s for t, s in sizes.items() if t.startswith("Loudness")][0], limitation)
+        self.assertIn("%d KB for the whole report" % sizes["The whole report"], limitation)
 
 
 if __name__ == "__main__":

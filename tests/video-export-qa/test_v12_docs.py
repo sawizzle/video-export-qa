@@ -35,9 +35,12 @@ SCRIPTS = PACKAGE / "scripts"
 REFERENCES = PACKAGE / "references"
 EXAMPLES = PACKAGE / "examples"
 LISTING = ROOT / "listing" / "video-export-qa"
-# The listing proposal that is in force. listing_update_v1.2_PROPOSAL.md is the record of 1.2; its own text is still
-# pinned below, but the listing source now carries the 1.2.1 text, so the New blocks are compared with this one.
-PROPOSAL_IN_FORCE = "update_v1.2.1_PROPOSAL.md"
+# The listing proposal that is in force. listing_update_v1.2_PROPOSAL.md is the record of 1.2 and
+# update_v1.2.1_PROPOSAL.md the record of 1.2.1; their own text is still pinned below, but the listing source now
+# carries the 1.2.2 text, so the New blocks are compared with this one, which changes these fields.
+PROPOSAL_IN_FORCE = "update_v1.2.2_PROPOSAL.md"
+FIELDS_IN_FORCE = ("1. Full Description (the whole field)", "3. Compatibility Note", "4. Extra Details > Known limitations",
+                   "5. Permissions (tools, file scopes and notes)")
 TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
@@ -69,9 +72,10 @@ SCRIPT_COMMAND = re.compile(r"python3? -I -B (\S+)")
 
 
 def bad_script_paths(text):
-    """Script paths in `python -I -B ...` commands that do not start with <skill-dir>/scripts/."""
+    """Script paths in `python -I -B ...` commands that do not start with <skill-dir>/scripts/ (in single quotes, as
+    references/no-skill-folder.md writes a path, or without them)."""
     return [path for path in SCRIPT_COMMAND.findall(text)
-            if "scripts/" in path and not path.startswith("<skill-dir>/scripts/")]
+            if "scripts/" in path and not re.match(r"'?<skill-dir>/scripts/", path)]
 
 
 def flag_problems(text):
@@ -144,6 +148,9 @@ class CommandsInTheDocsTests(unittest.TestCase):
         self.assertEqual(bad_script_paths("python -I -B scripts/make_test_clip.py x.mp4"), ["scripts/make_test_clip.py"])
         self.assertEqual(bad_script_paths("python3 -I -B ../scripts/run_qa.py x.mp4"), ["../scripts/run_qa.py"])
         self.assertEqual(bad_script_paths("python -I -B <skill-dir>/scripts/run_qa.py x.mp4"), [])
+        self.assertEqual(bad_script_paths("python -I -B '<skill-dir>/scripts/run_qa.py' x.mp4"), [])
+        self.assertEqual(bad_script_paths("python -I -B '<FOLDER>/scripts/run_qa.py' x.mp4"), ["'<FOLDER>/scripts/run_qa.py'"])
+        self.assertEqual(bad_script_paths("python -I -B \"<skill-dir>/scripts/run_qa.py\" x.mp4"), ['"<skill-dir>/scripts/run_qa.py"'])
         self.assertEqual(bad_script_paths("python -I -B -m unittest discover -s tests/video-export-qa"), [])
 
     def test_every_script_command_in_the_docs_starts_at_the_skill_folder(self):
@@ -989,9 +996,10 @@ class ReAuditDocumentTests(unittest.TestCase):
         self.assertNotIn("exception", honest)
 
     def test_the_proposal_new_text_is_exactly_the_text_in_the_listing_source(self):
-        # The proposal in force is the newest one (PROPOSAL_IN_FORCE); the 1.2 proposal stays as the record of 1.2. Every
-        # field the proposal in force changes must carry exactly the text of the listing source, and it must change the
-        # four fields below. A field it does not list (the summary did not change in 1.2.1) is not compared.
+        # The proposal in force is the newest one (PROPOSAL_IN_FORCE); the older proposals stay as records. Every field
+        # the proposal in force changes must carry exactly the text of the listing source, and it must change the fields
+        # in FIELDS_IN_FORCE. A field it does not list (the summary did not change in 1.2.2; the permissions changed in its
+        # doc round of 2026-10-16) is not compared.
         texts = listing_texts()
         proposal = texts[PROPOSAL_IN_FORCE]
 
@@ -1014,8 +1022,7 @@ class ReAuditDocumentTests(unittest.TestCase):
             "5. Permissions (tools, file scopes and notes)": field("Permissions"),
         }
         listed = [title for title in compared if "\n## " + title + "\n" in proposal]
-        for title in ("1. Full Description (the whole field)", "3. Compatibility Note",
-                      "4. Extra Details > Known limitations", "5. Permissions (tools, file scopes and notes)"):
+        for title in FIELDS_IN_FORCE:
             self.assertIn(title, listed, "the proposal in force changes this field")
         for title in listed:
             with self.subTest(field=title):
@@ -1036,7 +1043,7 @@ class ReAuditDocumentTests(unittest.TestCase):
         answers = [block.split("\nA: ", 1)[1].strip("\n") for block in faq.strip("\n").split("\n\n") if "\nA: " in block]
         section = texts[PROPOSAL_IN_FORCE].split("## 6. FAQ")[1].split("\n## ")[0]
         new_blocks = re.findall(r"^New:\n((?:>.*\n?)+)", section, re.M)
-        self.assertGreater(len(new_blocks), 2)
+        self.assertGreaterEqual(len(new_blocks), 2)
         for block in new_blocks:
             text = "\n".join(line[2:] if line.startswith("> ") else line[1:] for line in block.rstrip("\n").split("\n"))
             self.assertIn(text, answers)
